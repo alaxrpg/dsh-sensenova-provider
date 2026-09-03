@@ -251,6 +251,9 @@ export class SenseNovaSettingsController {
 
   private credentialStates = new Map<string, CredentialView>();
 
+  /** 上一次成功 describeAll 查询过的 refs 集合键（去重排序拼接）；用于检测快照替换引入的新 ref。 */
+  private describedRefsKey = '';
+
   private saving = false;
   private failed = false;
   private savedCount = 0;
@@ -265,6 +268,9 @@ export class SenseNovaSettingsController {
     this.disposers.push(
       scope.subscribe(() => {
         this.publish();
+        // 快照替换可能引入新 credential-ref（典型：构造时快照 loading、就绪后 accounts
+        // 才可见），集合变化时重查凭据配置状态，避免额外账户残留「未配置」误报。
+        this.describeIfRefsChanged();
       }),
     );
     void this.describeAll();
@@ -516,6 +522,23 @@ export class SenseNovaSettingsController {
     await this.describeAll();
   }
 
+  /** 当前页面涉及的 credential-ref 集合键（默认 ref + stored/added 账户 ref）。 */
+  private currentRefsKey(): string {
+    const ref = this.credentialRef();
+    const refs = new Set<string>([
+      ...(ref !== undefined ? [ref] : []),
+      ...this.storedAccounts().map((a) => a.apiKeyEnv),
+      ...this.addedAccounts.map((a) => a.apiKeyEnv),
+    ]);
+    return [...refs].sort().join(',');
+  }
+
+  /** refs 集合与上次成功查询不同则重查；查询失败保留旧键，下次快照变更自然重试。 */
+  private describeIfRefsChanged(): void {
+    if (this.currentRefsKey() === this.describedRefsKey) return;
+    void this.describeAll();
+  }
+
   /** 查询所有本页涉及的凭据引用的配置状态。 */
   private async describeAll(): Promise<void> {
     const refs = [
@@ -523,7 +546,10 @@ export class SenseNovaSettingsController {
       ...this.storedAccounts().map((a) => a.apiKeyEnv),
       ...this.addedAccounts.map((a) => a.apiKeyEnv),
     ];
-    if (refs.length === 0) return;
+    if (refs.length === 0) {
+      this.describedRefsKey = '';
+      return;
+    }
     let response: CredentialsDescribeResult;
     try {
       response = await this.credentials.describe(refs);
@@ -531,6 +557,7 @@ export class SenseNovaSettingsController {
       return;
     }
     if (!response.ok) return;
+    this.describedRefsKey = this.currentRefsKey();
     let changed = false;
     for (const ref of refs) {
       const view = response.value?.[ref];

@@ -163,7 +163,8 @@ function firstContextField(raw: Record<string, unknown>): number | undefined {
 }
 
 function firstMaxOutputField(raw: Record<string, unknown>): number | undefined {
-  return firstPositiveNumber(raw, ['max_tokens', 'max_output_tokens', 'max_completion_tokens', 'maxTokens', 'maxOutputTokens', 'maxCompletionTokens']);
+  // max_output_length 是 SenseNova /models 目录的实际字段名，置首优先；OpenAI 风格字段保留兜底。
+  return firstPositiveNumber(raw, ['max_output_length', 'max_tokens', 'max_output_tokens', 'max_completion_tokens', 'maxTokens', 'maxOutputTokens', 'maxCompletionTokens']);
 }
 
 /** 把目录声明的输入模态映射为宿主 ModelModality 列表；未声明时回退 ['text']。 */

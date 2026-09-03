@@ -244,3 +244,46 @@ test('SenseNovaSettingsController: effectiveActiveAccountId 派生', async () =>
   controller.dispose();
   controllerNone.dispose();
 });
+
+test('SenseNovaSettingsController: 快照延迟就绪后重查凭据，额外账户徽标反映真实配置', async () => {
+  const describeCalls: string[][] = [];
+  let value: SenseNovaConfig | undefined = undefined;
+  let status: ScopeSnapshot<SenseNovaConfig>['status'] = 'loading';
+  const listeners = new Set<() => void>();
+  const scope: SettingsScope<SenseNovaConfig> = {
+    getSnapshot: () => ({ status, value, base: undefined, user: value, writable: true, mode: 'host' }),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async set() {},
+    async unset() {},
+  };
+  const credentials: CredentialsFace = {
+    describe: async (refs) => {
+      describeCalls.push(refs);
+      const configured: Record<string, boolean> = {
+        SENSENOVA_API_KEY: true,
+        SENSENOVA_API_KEY_2: true,
+      };
+      return { ok: true, value: Object.fromEntries(refs.map((ref) => [ref, { configured: configured[ref] ?? false, writable: true }])) };
+    },
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+
+  // 构造时快照仍为 loading：accounts 不可见，首轮 describe 只含默认 ref。
+  const controller = new SenseNovaSettingsController(scope, credentials);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(controller.state().available, false);
+  assert.deepEqual(describeCalls.at(-1), ['SENSENOVA_API_KEY']);
+
+  // 宿主快照就绪：accounts 可见，订阅回调触发 refs 集合对比并重查。
+  status = 'ready';
+  value = { accounts: [{ id: 'account-2', label: '账户 2', apiKeyEnv: 'SENSENOVA_API_KEY_2' }] };
+  for (const listener of listeners) listener();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const account = controller.state().accounts.find((a) => a.id === 'account-2');
+  assert.ok(account, '账户 2 行存在');
+  assert.equal(account.configured, true, '快照就绪后徽标为已配置');
+  assert.deepEqual([...(describeCalls.at(-1) ?? [])].sort(), ['SENSENOVA_API_KEY', 'SENSENOVA_API_KEY_2']);
+  controller.dispose();
+});

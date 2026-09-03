@@ -338,6 +338,23 @@ test('listModels/resolveModel: 多模态 input_modalities 与上下文/最大输
   assert.equal(info.defaultMaxTokens, 8192);
 });
 
+test('listModels/resolveModel: 识别 SenseNova 目录 max_output_length 字段上报 defaultMaxTokens', async () => {
+  const adapter = catalogAdapter([
+    {
+      id: 'deepseek-v4-flash',
+      output_modalities: ['text'],
+      input_modalities: ['text'],
+      context_length: 1048576,
+      max_output_length: 65536,
+    },
+  ]);
+  await adapter.listModels('sensenova');
+
+  const info = await adapter.resolveModel('sensenova', 'deepseek-v4-flash');
+  assert.equal(info.context?.contextWindow, 1048576);
+  assert.equal(info.defaultMaxTokens, 65536);
+});
+
 test('resolveModel: reasoning 词表映射为 ReasoningEffortId 与默认级别', async () => {
   const adapter = catalogAdapter([
     {

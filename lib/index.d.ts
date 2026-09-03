@@ -1,15 +1,14 @@
 import z from "@deepseek-ai/schemastery";
 import { LlmAdapter } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
-
-//#region ../src/adapter.d.ts
+//#region src/adapter.d.ts
 /** 手动模型可选覆盖（用户设置持久化）。 */
 interface ModelSelection {
   include: readonly string[];
   exclude: readonly string[];
 }
 //#endregion
-//#region ../src/index.d.ts
+//#region src/index.d.ts
 declare const name = "llm-sensenova";
 declare const inject: string[];
 declare const DEFAULT_API_KEY_ENV = "SENSENOVA_API_KEY";
