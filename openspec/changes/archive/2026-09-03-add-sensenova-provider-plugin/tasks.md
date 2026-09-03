@@ -8,20 +8,20 @@
 
 ## 2. 配置与账号池
 
-- [x] 2.1 实现 `Config` schema（schemastery/zod）：`apiKeyEnv`（默认 `SENSENOVA_API_KEY`，credential-ref）、`apiBase`（默认 `https://token.sensenova.cn/v1`）、`accounts[]`（label/apiKeyEnv/apiKey）、`activeAccount`
+- [x] 2.1 实现 `Config` schema（schemastery/zod）：`apiKeyEnv`（默认 `SENSENOVA_API_KEY`，credential-ref）、`apiBase`（默认 `https://token.sensenova.cn/v1`）、`accounts[]`（label/apiKeyEnv）、`activeAccount`
 - [x] 2.2 实现 slot 归一化：default 槽 + accounts 槽，过滤无凭据条目
 - [x] 2.3 实现账号池：状态以 key 为键，`resolvedAccounts()` 去重、`selectActiveAccount()`、`resolveKey()`
-- [x] 2.4 实现 `markRejected`：429 → `cooldown`（Retry-After 计算 until，缺失兜底 60s）；401 → `disabled`
-- [x] 2.5 实现耗尽错误：全 disabled → `INVALID_CREDENTIAL`；否则 → `RATE_LIMIT` 附最早恢复 `providerRetryAfterMs`（≤900s）
+- [x] 2.4 实现 `markRejected`：`invalid-credential`（401）→ `disabled` 永久禁用；`rate-limit`（429）→ 不写任何状态（不冷却，见 spec「429 不冷却不轮换」）
+- [x] 2.5 实现耗尽错误：全 disabled（仅 401 产生）→ `INVALID_CREDENTIAL`；429 单独作为 `RATE_LIMIT` 抛给宿主（`Retry-After` >0 且 ≤3000ms 透传 `providerRetryAfterMs`）
 
 ## 3. 适配器
 
 - [x] 3.1 实现 `LlmAdapter` 子类：`providerInfo()` 返回 `{id: 'sensenova', name: 'SenseNova'}`
 - [x] 3.2 实现 `listModels()` / `resolveModel()`：`GET {apiBase}/v1/models`，无 key 时返回空目录
 - [x] 3.3 实现 `stream()`：`POST /v1/chat/completions`，携带 `attributionHeaders()` 与 `Authorization: Bearer <key>`
-- [x] 3.4 实现流开始前的轮换循环：`tried` 集合 + `rotateApiKey`，429/401 换下一个，每个 key 至多一次
+- [x] 3.4 实现流开始前的轮换循环：`tried` 集合 + `rotateApiKey`，仅 401 换下一个，429 不轮换直接抛 `RATE_LIMIT`，每个 key 至多尝试一次
 - [x] 3.5 实现 OpenAI SSE → `StreamChunk` 翻译（文本/推理/工具调用/usage/finish），借鉴 `dsh-llm-pi-ai` 的 `toStreamChunks`
-- [x] 3.6 `providerRetryPolicy()` 返回 `undefined`（宿主默认重试）
+- [x] 3.6 `providerRetryPolicy()` 声明 normal / maxRetries=1000 / backoff 上限 3000ms，覆盖 429 高频常态
 
 ## 4. 插件入口与设置段
 
@@ -39,6 +39,6 @@
 ## 6. 验证与发布
 
 - [x] 6.1 `npm run typecheck` 与 `npm run build`（tsdown）通过
-- [x] 6.2 单元测试：账号池轮换（429 冷却/401 禁用/耗尽错误）、Retry-After 解析、SSE 翻译
+- [x] 6.2 单元测试：账号池轮换（429 不冷却不轮换/401 禁用/耗尽错误）、Retry-After 双阈值、SSE 翻译
 - [ ] 6.3 本地装回验证：`dsh plugin --profile web add <path>` 后重启，Models 页出现 sensenova 卡片且目录可拉取
 - [ ] 6.4 npm 发布 `@alaxrpg/dsh-sensenova-provider`（alpha dist-tag），市场验证更新检测

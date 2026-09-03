@@ -1,6 +1,6 @@
 ## Purpose
 
-为 DeepSeek Harness 提供 SenseNova（OpenAI 兼容）LLM provider 接入：注册独立 `sensenova` 路由，支持在同一 baseURL 下配置多个 API Key 账号并在限流或密钥失效时自动轮换。
+为 DeepSeek Harness 提供 SenseNova（OpenAI 兼容）LLM provider 接入：注册独立 `sensenova` 路由，支持在同一 baseURL 下配置多个 API Key 账号，在密钥失效（401）时自动轮换，429 限流交由宿主重试层退避后原 key 重试。
 
 ## ADDED Requirements
 
@@ -15,7 +15,7 @@
 
 ### Requirement: 多账号配置
 
-系统 SHALL 支持在同一 `apiBase` 下配置一个默认账号与零到多个额外账号，每个账号包含标签与凭据引用（`apiKeyEnv` 或组合配置中的字面 `apiKey`）。
+系统 SHALL 支持在同一 `apiBase` 下配置一个默认账号与零到多个额外账号，每个账号包含标签与凭据引用（`apiKeyEnv`，POSIX shell 标识符形式的 credential-ref）。
 
 #### Scenario: 仅默认账号
 
@@ -25,26 +25,31 @@
 #### Scenario: 额外账号参与轮换
 
 - **WHEN** 用户配置了 `accounts` 列表
-- **THEN** 每个同时具备 `apiKeyEnv` 或 `apiKey` 的条目都成为一个可轮换账号，无凭据的条目被忽略
+- **THEN** 每个具备合法 `apiKeyEnv` credential-ref 的条目都成为一个可轮换账号，无合法凭据引用的条目被忽略
 
 #### Scenario: 手动钉选账号
 
 - **WHEN** 用户设置 `activeAccount` 指向某个账号 id
 - **THEN** 该账号在可用时优先服务请求，不可用时回退到第一个可用账号
 
-### Requirement: 429 限流冷却
+### Requirement: 429 不冷却不轮换
 
-系统 SHALL 在收到 429 响应时将该账号标记为冷却，冷却时长为响应 `Retry-After` 头指定的时间；响应未携带 `Retry-After` 时使用 60 秒兜底冷却。
+系统 SHALL 在收到 429 响应时不做账号级冷却、不切换到其他账号：SenseNova 429 属渠道常态性 RPM 瞬时超限，不代表账号异常，一个会话固定使用一个 key（轮换会破坏服务端按 key 命中的 prompt 缓存）。系统 SHALL 以 `RATE_LIMIT` 错误结束本次请求，交由宿主重试层退避后使用原 key 重试；响应携带的 `Retry-After` 在大于 0 且不超过 3000 毫秒时作为 `providerRetryAfterMs` 透传给宿主。
 
-#### Scenario: 按 Retry-After 冷却
+#### Scenario: 429 不轮换不冷却
 
-- **WHEN** 某账号请求收到 429 且携带 `Retry-After: 30`
-- **THEN** 该账号被标记为冷却，30 秒内不再被选中，随后自动恢复可用
+- **WHEN** 某账号请求收到 429 且存在其他可用账号
+- **THEN** 系统不标记冷却、不切换账号，以 `RATE_LIMIT` 错误结束本次请求由宿主重试层退避后用原 key 重试
 
-#### Scenario: 缺失 Retry-After 兜底
+#### Scenario: 短 Retry-After 透传
 
-- **WHEN** 某账号请求收到 429 但无 `Retry-After` 头
-- **THEN** 该账号被标记为冷却 60 秒
+- **WHEN** 429 响应携带 `Retry-After` 且换算毫秒值大于 0 且不超过 3000
+- **THEN** 系统将该值作为 `providerRetryAfterMs` 附在 `RATE_LIMIT` 错误上透传给宿主
+
+#### Scenario: 超长 Retry-After 不突破上限
+
+- **WHEN** 429 响应的 `Retry-After` 大于 3000 毫秒
+- **THEN** 系统不透传该值（不截断），由宿主本地退避策略计算延迟
 
 ### Requirement: 401 禁用账号
 
@@ -57,22 +62,17 @@
 
 ### Requirement: 轮换与耗尽错误
 
-系统 SHALL 在流开始前自动切换到下一个可用账号；当所有账号都不可用时应给出明确错误。
+系统 SHALL 仅在账号密钥失效（401）时自动切换到下一个可用账号；当所有账号都被 401 禁用时应给出明确错误。429 不触发轮换（见「429 不冷却不轮换」需求）。
 
-#### Scenario: 自动轮换
+#### Scenario: 401 触发自动轮换
 
-- **WHEN** 当前账号在响应头返回前收到 429 或 401，且存在尚未尝试的可用账号
-- **THEN** 系统标记当前账号并改用下一个可用账号重试，每个 key 至多尝试一次
+- **WHEN** 当前账号在响应头返回前收到 401，且存在尚未尝试的可用账号
+- **THEN** 系统标记该账号为禁用并改用下一个可用账号重试，每个 key 至多尝试一次
 
 #### Scenario: 全账号被 401 拒绝
 
 - **WHEN** 所有已配置账号均返回 401
 - **THEN** 系统以 `INVALID_CREDENTIAL` 错误结束请求
-
-#### Scenario: 全账号限流
-
-- **WHEN** 所有已配置账号均处于冷却状态
-- **THEN** 系统以 `RATE_LIMIT` 错误结束请求，并携带最早的冷却恢复时间
 
 ### Requirement: 流式生成
 
@@ -81,7 +81,7 @@
 #### Scenario: 正常流式生成
 
 - **WHEN** 用户以 `sensenova` 路由发起生成请求
-- **THEN** 系统向 `{apiBase}/v1/chat/completions` 发送请求，并将 SSE 流翻译为宿主流式块直至 `finish`
+- **THEN** 系统向 `{apiBase}/chat/completions` 发送请求，并将 SSE 流翻译为宿主流式块直至 `finish`
 
 #### Scenario: 流开始后失败不回放
 
@@ -95,7 +95,7 @@
 #### Scenario: 拉取模型目录
 
 - **WHEN** 存在至少一个可用账号 key
-- **THEN** 系统调用 `{apiBase}/v1/models` 并返回端点声明的模型列表
+- **THEN** 系统调用 `{apiBase}/models` 并返回端点声明的模型列表
 
 #### Scenario: 无 key 时不阻塞
 

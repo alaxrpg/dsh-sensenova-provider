@@ -18,20 +18,15 @@
 - **WHEN** 目录为某模型声明 `max_output_tokens` 或等价最大输出字段
 - **THEN** `resolveModel()` 返回对应的 `defaultMaxTokens`，供宿主自动配置请求上限
 
-#### Scenario: 目录提供档位词表时优先采用
+#### Scenario: 按目录配置思考级别
 
 - **WHEN** 目录为某模型提供 `reasoning_efforts` 词表 `low`、`medium`、`high`，并声明 `medium` 为默认级别
 - **THEN** `resolveModel()` 将相同 wire value 映射到 `reasoning.efforts` 与 `reasoning.defaultEffort`，静态表不参与覆盖
 
-#### Scenario: 目录仅标记支持时按静态表暴露档位
+#### Scenario: 目录仅标记支持但未提供词表
 
-- **WHEN** 目录中 `deepseek-v4-flash` 的 `supported_features` 含 `reasoning`（无任何档位词表字段），随后调用该模型的 `resolveModel()`
-- **THEN** 返回的 `reasoning.efforts` 为 `low`/`medium`/`high`/`none` 且不设置 `defaultEffort`，宿主模型选择器可让用户选择档位（含 `none` 关闭思考）
-
-#### Scenario: 静态表未覆盖的模型不虚构档位
-
-- **WHEN** 目录某模型的 `supported_features` 含 `reasoning` 但无档位词表，且其 id 不在内置模型族档位表中
-- **THEN** 系统不为该模型声明 `reasoning.efforts`，保持该项未知并使用 provider 自身默认行为
+- **WHEN** 模型目录只有 `reasoning_effort`、`thinking` 或 `supported_parameters`/`supported_features: ["reasoning"]` 支持标记，没有可选级别词表
+- **THEN** 系统按内置模型族档位表决定：模型 id 命中静态表（如 `deepseek-v4-flash`）时返回对应 `reasoning.efforts`（如 `low`/`medium`/`high`/`none`）且不设 `defaultEffort`，宿主选择器可让用户选档（含 `none` 关思考）；id 不在静态表时保持该项未知，不虚构思考级别
 
 #### Scenario: 目录刷新后同步能力
 

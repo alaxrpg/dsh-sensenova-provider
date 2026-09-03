@@ -15,7 +15,7 @@
 **Goals:**
 
 - 注册独立 `sensenova` 路由，提供多账号配置（默认 key + `accounts[]` + `activeAccount` + 共享 `apiBase`）。
-- 在流开始前完成多账号轮换：429 按 `Retry-After` 冷却、401 禁用，耗尽后给出明确错误。
+- 在流开始前完成多账号轮换：仅 401 禁用并轮换，429 不冷却、不轮换（交宿主重试层退避后原 key 重试），耗尽后给出明确错误。
 - 从 `/v1/models` 实时拉取模型目录。
 - 提供 Web 设置页（`settings.section` + `settings.models.provider-card`）。
 
@@ -33,8 +33,8 @@
 **D2：轮换状态以 API key 为键，存内存 Map。**
 与参考插件一致：两个 slot 配同一 key 共享一条状态；key 在凭据服务中被改值 = 新键、状态自然清零。不持久化，重启后全账号恢复可用。
 
-**D3：429 冷却时长来自 `Retry-After`，不再探测窗口。**
-命令式标记：`markRejected(key, 'rate-limit', retryAfterMs)` 直接写 `cooldown { until }`；`Retry-After` 缺失时用 `DEFAULT_429_COOLDOWN_MS = 60_000` 兜底。删除参考插件的 `probeWindow` 与 `FiveHourWindowProbe` 整条链路。
+**D3：429 不冷却、不轮换，抛 `RATE_LIMIT` 交宿主。**
+SenseNova 429 属渠道常态性 RPM 瞬时超限，不代表账号异常；一个会话固定一个 key（轮换会破坏服务端按 key 命中的 prompt 缓存）。`markRejected(key, 'rate-limit', retryAfterMs)` 不写任何状态；adapter 直接抛 `RATE_LIMIT`，`Retry-After` > 0 且 ≤ 3000ms 时作为 `providerRetryAfterMs` 透传，> 3000ms 不透传（不截断）由宿主本地退避计算。删除参考插件的 `probeWindow` 与 `FiveHourWindowProbe` 整条链路与账号冷却设计。
 
 **D4：401 永久禁用该 key。**
 `markRejected(key, 'invalid-credential')` 写 `disabled { until: 0 }`，直到该 key 值在凭据服务中被修改（新 key = 新状态）。
@@ -42,8 +42,8 @@
 **D5：轮换只在响应头返回前。**
 `stream()` 里 `POST /v1/chat/completions` 成功拿到 `response.ok` 即锁定当前 key，SSE 流出字后的任何失败不再回放、直接结束。
 
-**D6：重试用宿主默认。**
-`providerRetryPolicy()` 返回 `undefined`（走宿主默认）；429/401 由轮换层处理，5xx/网络由宿主默认退避处理。
+**D6：声明 provider 重试策略（normal / maxRetries=1000 / backoff 上限 3s）。**
+SenseNova 429 高频常态，宿主默认 5 次退避上限 10s 不足以覆盖瞬时 RPM 窗口。`providerRetryPolicy()` 返回 `resolveRetryPolicy({ mode:'normal', maxRetries:1000, backoff:{ maxDelayMs:3000 } }, 'llm-sensenova.retryPolicy')`：本地退避单次延迟不超过 3000ms，配合 429 的 `RATE_LIMIT` 由宿主重试层反复退避后原 key 重试；5xx/网络同理。
 
 **D7：`peerDependencies` 不设上界。**
 宿主接口包全部 `peerDependencies` 用 `>=0.1.2-alpha.3`（用户既有规则，区别于参考插件的 `^` 写法）。
@@ -56,10 +56,10 @@ OpenAI SSE（`choices[].delta` / `finish_reason` / `usage`）→ `StreamChunk` �
 
 ## Risks / Trade-offs
 
-- [429 响应缺失或无法解析 `Retry-After`] → 用 60s 固定兜底冷却，避免对上游重试风暴；兜底值做成常量便于后续调整。
+- [429 高频常态] → 账号层不冷却、不轮换，adapter 抛 `RATE_LIMIT` 并声明 provider 重试策略（maxRetries=1000、退避上限 3s），由宿主反复退避后原 key 重试；`Retry-After` > 0 且 ≤ 3000ms 透传、> 3000ms 不透传。
 - [`/v1/models` 需鉴权，目录拉取依赖可用 key] → `listModels()` 先经账号池取第一个可用 key；无任何 key 时返回空目录（advisory），不阻塞路由注册。
 - [轮换上限] → `tried.size < 账号数` 保证每个 key 至多尝试一次，避免共享同一 key 的多个 slot 造成死循环。
-- [全账号 401] → 抛 `INVALID_CREDENTIAL`；全账号冷却 → 抛 `RATE_LIMIT` 并附最早恢复的 `providerRetryAfterMs`（`<= 900s` 才附）。
+- [全账号 401] → 抛 `INVALID_CREDENTIAL`。账号池无冷却状态，429 不产生任何写入；429 一律作为 `RATE_LIMIT` 抛给宿主重试层（`Retry-After` > 0 且 ≤ 3000ms 透传）。
 - [敏感凭据] → 实现只处理 key 的路径/长度/元数据，key 值走宿主凭据服务，不进日志、不发送给模型（隐私边界写入 spec）。
 
 ## Migration Plan

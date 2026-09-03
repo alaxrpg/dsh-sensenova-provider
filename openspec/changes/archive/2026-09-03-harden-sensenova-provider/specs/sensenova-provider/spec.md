@@ -4,6 +4,11 @@
 
 系统 SHALL 从 `{apiBase}/models` 实时获取模型目录，并仅暴露可作为对话模型路由的条目：`output_modalities` 必须包含 `text`，且条目 id 不得命中已知不可路由清单或进程内失败缓存；系统 SHALL 从目录字段声明每个模型的输入模态与标准可读显示名；在没有任何可用 key 时返回空目录而不阻塞路由注册。
 
+#### Scenario: 拉取模型目录
+
+- **WHEN** 存在至少一个可用账号 key
+- **THEN** 系统调用 `{apiBase}/models` 并返回端点声明的文本对话模型
+
 #### Scenario: 拉取并过滤模型目录
 
 - **WHEN** 存在至少一个可用账号 key，且端点返回的目录包含文生图模型（`output_modalities` 不含 `text`）与已知不可路由模型 `sensenova-6.7-flash-lite`
@@ -110,7 +115,7 @@
 
 ### Requirement: Provider 重试策略
 
-系统 SHALL 为 `sensenova` 路由声明 `normal` 重试策略：最多重试 1000 次，本地指数退避单次延迟上限 3 秒（3000 毫秒），覆盖宿主默认的 10 秒上限；服务端提供的 `Retry-After` 超过 3000 毫秒时 SHALL NOT 作为 provider 延迟透传，也不得截断后透传，改由本地策略计算，避免突破 3 秒上限；账号冷却仍可保留服务端原始时长，二者使用独立阈值。
+系统 SHALL 为 `sensenova` 路由声明 `normal` 重试策略：最多重试 1000 次，本地指数退避单次延迟上限 3 秒（3000 毫秒），覆盖宿主默认的 10 秒上限；服务端提供的 `Retry-After` 超过 3000 毫秒时 SHALL NOT 作为 provider 延迟透传，也不得截断后透传，改由本地策略计算，避免突破 3 秒上限；429 不产生账号冷却（见 add「429 不冷却不轮换」），`Retry-After` 仅在大于 0 且不超过 3000 毫秒时作为 `providerRetryAfterMs` 透传。
 
 #### Scenario: 限流时按策略重试
 

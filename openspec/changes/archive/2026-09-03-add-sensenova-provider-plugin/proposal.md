@@ -1,13 +1,13 @@
 ## Why
 
-当前 `sensennova` 通过宿主内置的 `llm-pi-ai` 接入，而内置可配置 provider 每个路由只支持一个 `apiKeyEnv`，无法配置多个 API Key（账号）并在限流时自动轮换。需要一个独立插件注册 `sensenova` 路由，提供「同一 baseURL 下多账号轮换」能力。
+当前 `sensennova` 通过宿主内置的 `llm-pi-ai` 接入，而内置可配置 provider 每个路由只支持一个 `apiKeyEnv`，无法配置多个 API Key（账号）并在密钥失效时自动轮换。需要一个独立插件注册 `sensenova` 路由，提供「同一 baseURL 下多账号 401 轮换 + 429 交宿主退避」能力。
 
 ## What Changes
 
 - 新增插件 `@alaxrpg/dsh-sensenova-provider`（仓库 `alaxrpg/dsh-sensenova-provider`，目录 `deepseek-harness-plugin/dsh-sensenova-provider/`），按 alpha 线发布。
 - 注册独立的 `sensenova` provider 路由，与现有 `llm-pi-ai` 的 `sensennova`（双 n）并存，互不冲突。
 - 提供多账号配置：默认账号 `apiKeyEnv`（默认 `SENSENOVA_API_KEY`）+ 共享 `apiBase`（默认 `https://token.sensenova.cn/v1`）+ 额外账号 `accounts[]` + 手动钉选 `activeAccount`。
-- 提供多账号轮换：429 按 `Retry-After` 冷却（缺失兜底 60s）、401 禁用该 key，流开始前自动换到下一个可用账号。
+- 提供多账号轮换：仅 401 禁用该 key 并自动切换到下一个可用账号；429 不轮换、不冷却（SenseNova 渠道常态性 RPM 瞬时超限，一个会话固定使用一个 key，保护服务端按 key 命中的 prompt 缓存），直接抛 `RATE_LIMIT` 交由宿主重试层退避后原 key 重试。
 - 实时拉取模型目录：`GET /v1/models`（OpenAI 兼容端点，需先取得可用 key）。
 - 提供 Web 设置页：`apiBase`、默认 key、账号增删、`activeAccount` 选择。
 - 显式排除（不实现）：用量 dashboard、`/commandcode` 命令、浏览器登录流、web search 后端、plan/计费感知选择器、套餐/优惠/峰谷价快照、推理强度快照、图片门控快照、5 小时窗口探测。
