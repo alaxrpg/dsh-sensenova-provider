@@ -1,6 +1,5 @@
 node_modules
 .tooling/
-lib/
 .pnpm-store/
 *.tsbuildinfo
 *.log
