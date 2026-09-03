@@ -39,6 +39,7 @@ import type {
   ToolResultBlock,
 } from '@deepseek-ai/dsh-llm';
 import { parseRetryAfterMs } from './accounts.ts';
+import { KeyedConcurrencyGate, type Release } from './concurrency.ts';
 
 /**
  * SenseNova 目录通常不披露上下文字段，这里用 131072 作为合理默认
@@ -75,6 +76,8 @@ export interface SensenovaConnection {
   apiBase: string;
   /** 已配置账户槽位总数，用于轮换上限（tried.size < accountCount）。 */
   accountCount: number;
+  /** 每 key 并发生成请求上限（正整数）；非法值在并发闸内回退 1。 */
+  concurrency?: number;
   /** 手动模型可选覆盖；缺省等价于空选择（自动过滤）。 */
   modelSelection?: ModelSelection;
 }
@@ -82,7 +85,7 @@ export interface SensenovaConnection {
 const EMPTY_MODEL_SELECTION: ModelSelection = { include: [], exclude: [] };
 
 export interface SensenovaAdapterDeps {
-  /** 每请求的连接事实（apiBase、账户数）。 */
+  /** 每请求的连接事实（apiBase、账户数、并发上限）。 */
   options: () => SensenovaConnection;
   /** 解析一个可用 key（无可解析 key 时抛 MISSING_CREDENTIAL）。 */
   resolveApiKey: (connection: SensenovaConnection) => Promise<string>;
@@ -92,6 +95,8 @@ export interface SensenovaAdapterDeps {
     rejection: 'invalid-credential',
   ) => Promise<string | undefined>;
   fetchImpl?: typeof fetch;
+  /** 每 key 并发闸；缺省为进程内实例（可注入以利测试）。 */
+  concurrencyGate?: KeyedConcurrencyGate;
 }
 
 /** 目录条目：宿主所需的能力元数据快照（listModels 后缓存，resolveModel 消费）。 */
@@ -725,6 +730,7 @@ function httpError(status: number, errText: string, retryAfterMs: number | undef
 export class SensenovaAdapter extends LlmAdapter {
   private readonly deps: SensenovaAdapterDeps;
   private readonly fetchImpl: typeof fetch;
+  private readonly gate: KeyedConcurrencyGate;
   private catalog: CatalogEntry[] = [];
   /** 进程内失败缓存：运行时返回 MODEL_NOT_FOUND 的模型 id，直到适配器生命周期结束。 */
   private readonly failedModels = new Set<string>();
@@ -733,6 +739,7 @@ export class SensenovaAdapter extends LlmAdapter {
     super();
     this.deps = deps;
     this.fetchImpl = deps.fetchImpl ?? fetch;
+    this.gate = deps.concurrencyGate ?? new KeyedConcurrencyGate();
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -803,64 +810,83 @@ export class SensenovaAdapter extends LlmAdapter {
     const connection = this.deps.options();
     const body = JSON.stringify(buildOpenAiBody(options));
     const tried = new Set<string>();
+    const limit = connection.concurrency;
     let apiKey = await this.deps.resolveApiKey(connection);
     let response: Response | undefined;
+    // 当前 attempt 持有的并发额度；成功进入流式阶段后保持到 finally 释放。
+    let release: Release | undefined;
 
-    for (let rotations = 0; ; ) {
-      tried.add(apiKey);
-      let attempt: Response;
-      try {
-        attempt = await this.fetchImpl(`${connection.apiBase}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${apiKey}`,
-            ...attributionHeaders(),
-          },
-          body,
-          ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        });
-      } catch (error) {
-        if (options.signal?.aborted) throw error;
-        throw new LlmError(`llm-sensenova: request to ${connection.apiBase} failed: ${errorChain(error)}；连接 SenseNova API 失败，通常是网络或代理问题`, 'TRANSPORT', { cause: error });
-      }
-      if (attempt.ok) {
-        response = attempt;
-        break;
-      }
-      const errText = await attempt.text().catch(() => '');
-      const retryAfterMs = parseRetryAfterMs(attempt.headers.get('retry-after'));
-      // 404 模型不可路由：标记失败且不轮换/不重试。
-      const modelNotFound = attempt.status === 404 && isModelNotFoundText(errText);
-      if (modelNotFound) {
-        this.failedModels.add(options.model);
+    try {
+      for (let rotations = 0; ; ) {
+        tried.add(apiKey);
+        // 按本次 attempt 实际使用的 key 获取并发额度；排队期间中止会在此 reject（不占额度）。
+        release = await this.gate.acquire(apiKey, limit, options.signal);
+        let attempt: Response;
+        try {
+          attempt = await this.fetchImpl(`${connection.apiBase}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${apiKey}`,
+              ...attributionHeaders(),
+            },
+            body,
+            ...(options.signal !== undefined ? { signal: options.signal } : {}),
+          });
+        } catch (error) {
+          release();
+          release = undefined;
+          if (options.signal?.aborted) throw error;
+          throw new LlmError(`llm-sensenova: request to ${connection.apiBase} failed: ${errorChain(error)}；连接 SenseNova API 失败，通常是网络或代理问题`, 'TRANSPORT', { cause: error });
+        }
+        if (attempt.ok) {
+          response = attempt;
+          break; // 额度随 response 保留，由外层 finally 在流结束后释放
+        }
+        const errText = await attempt.text().catch(() => '');
+        const retryAfterMs = parseRetryAfterMs(attempt.headers.get('retry-after'));
+        // 404 模型不可路由：标记失败且不轮换/不重试。
+        const modelNotFound = attempt.status === 404 && isModelNotFoundText(errText);
+        if (modelNotFound) {
+          release();
+          release = undefined;
+          this.failedModels.add(options.model);
+          throw httpError(attempt.status, errText, retryAfterMs);
+        }
+        // 429：SenseNova 渠道常态性 RPM 瞬时超限，不代表账号被封。不轮换 key
+        // （一个会话固定使用一个 key，轮换会破坏服务端按 key 命中的 prompt 缓存）、
+        // 也不做账号冷却，直接抛 RATE_LIMIT 交给宿主重试层自动退避后原 key 重试。
+        // 并发闸已在源头抑制并发超限，此处为兜底。
+        const rotatable = attempt.status === 401;
+        if (rotatable && options.signal?.aborted !== true && rotations < connection.accountCount) {
+          rotations += 1;
+          const next = await this.deps.rotateApiKey(
+            apiKey,
+            'invalid-credential',
+          );
+          if (next !== undefined && !tried.has(next)) {
+            // 401 预流轮换：先释放旧 key 额度，下一轮为新 key 重新获取。
+            release();
+            release = undefined;
+            apiKey = next;
+            continue;
+          }
+        }
+        release();
+        release = undefined;
         throw httpError(attempt.status, errText, retryAfterMs);
       }
-      // 429：SenseNova 渠道常态性 RPM 瞬时超限，不代表账号被封。不轮换 key
-      // （一个会话固定使用一个 key，轮换会破坏服务端按 key 命中的 prompt 缓存）、
-      // 也不做账号冷却，直接抛 RATE_LIMIT 交给宿主重试层自动退避后原 key 重试。
-      const rotatable = attempt.status === 401;
-      if (rotatable && options.signal?.aborted !== true && rotations < connection.accountCount) {
-        rotations += 1;
-        const next = await this.deps.rotateApiKey(
-          apiKey,
-          'invalid-credential',
-        );
-        if (next !== undefined && !tried.has(next)) {
-          apiKey = next;
-          continue;
-        }
-      }
-      throw httpError(attempt.status, errText, retryAfterMs);
-    }
 
-    if (response === undefined) {
-      // 不可达：循环要么 break（成功）要么 throw；仅用于满足明确赋值分析。
-      throw new LlmError('llm-sensenova: SenseNova API returned no response', 'PROVIDER_PROTOCOL_ERROR');
+      if (response === undefined) {
+        // 不可达：循环要么 break（成功）要么 throw；仅用于满足明确赋值分析。
+        throw new LlmError('llm-sensenova: SenseNova API returned no response', 'PROVIDER_PROTOCOL_ERROR');
+      }
+      if (response.body === null) {
+        throw new LlmError('llm-sensenova: SenseNova API returned no response body', 'PROVIDER_PROTOCOL_ERROR');
+      }
+      yield* parseOpenAiSse(response.body, options.signal);
+    } finally {
+      release?.();
     }
-    if (response.body === null) {
-      throw new LlmError('llm-sensenova: SenseNova API returned no response body', 'PROVIDER_PROTOCOL_ERROR');
-    }
-    yield* parseOpenAiSse(response.body, options.signal);
   }
 }

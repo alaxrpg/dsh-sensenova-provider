@@ -102,6 +102,7 @@ function AdvancedSettings(props: {
   const [expanded, setExpanded] = useState(false);
   const customizedCount =
     (props.state.apiBase !== DEFAULT_API_BASE ? 1 : 0) +
+    (props.state.concurrency !== 1 ? 1 : 0) +
     (props.state.modelSelectionInclude.length > 0 ? 1 : 0) +
     (props.state.modelSelectionExclude.length > 0 ? 1 : 0);
 
@@ -149,6 +150,23 @@ function AdvancedSettings(props: {
         </div>
 
         <div className="sn-models">
+          <div className="sn-field">
+            <label className="sn-label" htmlFor="sn-concurrency">
+              {props.t('concurrency')}
+            </label>
+            <input
+              id="sn-concurrency"
+              className="sn-input"
+              type="number"
+              min={1}
+              step={1}
+              value={props.state.concurrencyDraft}
+              disabled={props.disabled}
+              spellCheck={false}
+              onChange={(event: ChangeEventLike) => props.edit('concurrency', event.target.value)}
+            />
+            <p className="sn-hint">{props.t('concurrencyHint')}</p>
+          </div>
           <div className="sn-field">
             <label className="sn-label" htmlFor="sn-model-selection-include">
               {props.t('modelInclude')}
@@ -228,6 +246,7 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
           disabled={disabled || !state.defaultWritable}
           configured={state.defaultConfigured}
           clearStaged={state.defaultClearStaged}
+          isEffective={state.effectiveActiveAccountId === 'default'}
           onEdit={props.editDefaultKey}
           onToggleClear={props.toggleDefaultKeyClear}
         />
@@ -289,7 +308,8 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
                 refs={credentialRefs}
                 index={index}
                 disabled={disabled}
-                isActive={state.activeAccountDraft === account.id}
+                isActive={state.effectiveActiveAccountId === account.id}
+                isPinned={state.activeAccountDraft === account.id}
                 onRemove={() => props.removeAccount(account.id)}
                 onLabel={(text) => props.editAccountLabel(account.id, text)}
                 onKey={(text) => props.editAccountKey(account.id, text)}
@@ -338,6 +358,7 @@ function DefaultKeyField(props: {
   disabled: boolean;
   configured: boolean;
   clearStaged: boolean;
+  isEffective: boolean;
   onEdit: (text: string) => void;
   onToggleClear: () => void;
 }): JSX.Element {
@@ -350,6 +371,9 @@ function DefaultKeyField(props: {
           {t('defaultKey')}
         </label>
         <span className="sn-badges">
+          {props.isEffective ? (
+            <span className="sn-badge sn-badgeActive">{t('activeBadgeEffective')}</span>
+          ) : null}
           <button type="button" className="sn-reset" disabled={props.disabled} onClick={() => setVisible((v) => !v)}>
             {visible ? t('hide') : t('show')}
           </button>
@@ -391,6 +415,7 @@ function AccountRow(props: {
   refs: ReadonlySet<string>;
   disabled: boolean;
   isActive: boolean;
+  isPinned: boolean;
   onRemove: () => void;
   onLabel: (text: string) => void;
   onKey: (text: string) => void;
@@ -411,7 +436,9 @@ function AccountRow(props: {
           <span className="sn-badges">
             <StatusBadge configured={account.configured} t={t} />
             {props.isActive ? (
-              <span className="sn-badge sn-badgeActive">{t('activeBadge')}</span>
+              <span className="sn-badge sn-badgeActive">
+                {props.isPinned ? t('activeBadge') : t('activeBadgeEffective')}
+              </span>
             ) : null}
           </span>
           <button

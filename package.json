@@ -1,6 +1,6 @@
 {
   "name": "@alaxrpg/dsh-sensenova-provider",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Unofficial DeepSeek Harness LLM provider plugin for SenseNova (OpenAI-compatible). Registers the 'sensenova' provider route with multi-account API-key rotation, a Models-page card, and a live model catalog.",
   "type": "module",
   "main": "./lib/index.js",

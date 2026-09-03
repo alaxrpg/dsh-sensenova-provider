@@ -16,9 +16,21 @@ export const SENSENOVA_DISPLAY_NAME = 'SenseNova';
 /** 默认 apiBase 与默认凭据环境变量。 */
 export const DEFAULT_API_BASE = 'https://token.sensenova.cn/v1';
 export const DEFAULT_API_KEY_ENV = 'SENSENOVA_API_KEY';
+/** 默认每 key 并发生成请求上限（并发闸缺省值）。 */
+export const DEFAULT_CONCURRENCY = 1;
+
+/** 把并发上限输入归一化为正整数（非法/无法解析回退默认 1）。 */
+export function normalizeConcurrency(value: unknown): number {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isInteger(parsed) && parsed >= 1) return parsed;
+  }
+  return DEFAULT_CONCURRENCY;
+}
 
 /** 可编辑的设置字段。 */
-export type FieldName = 'apiBase' | 'apiKeyEnv' | 'activeAccount' | 'modelSelectionInclude' | 'modelSelectionExclude';
+export type FieldName = 'apiBase' | 'apiKeyEnv' | 'activeAccount' | 'concurrency' | 'modelSelectionInclude' | 'modelSelectionExclude';
 
 /** accounts 数组元素（与冻结契约一致）。 */
 export interface AccountConfig {
@@ -34,6 +46,8 @@ export interface SenseNovaConfig {
   accounts?: AccountConfig[];
   activeAccount?: string;
   modelSelection?: { include?: string[]; exclude?: string[] };
+  /** 每 key 并发生成请求上限（正整数，默认 1）。 */
+  concurrency?: number;
 }
 
 /** credentials 域提供的面（对齐参考实现的 remote.credentials）。 */
@@ -100,6 +114,10 @@ export interface SettingsState {
   accounts: AccountView[];
   activeAccount: string;
   activeAccountDraft: string;
+  /** 当前实际生效账户 id（'default' 指默认账户卡，'' 表示无已配置账户）。 */
+  effectiveActiveAccountId: string;
+  concurrency: number;
+  concurrencyDraft: string;
   modelSelectionInclude: string[];
   modelSelectionExclude: string[];
   modelSelectionIncludeDraft: string;
@@ -218,6 +236,7 @@ export class SenseNovaSettingsController {
   private stagedApiBase: string | undefined;
   private stagedApiKeyEnv: string | undefined;
   private stagedActiveAccount: string | undefined;
+  private stagedConcurrency: string | undefined;
   private stagedModelSelectionInclude: string | undefined;
   private stagedModelSelectionExclude: string | undefined;
 
@@ -290,11 +309,14 @@ export class SenseNovaSettingsController {
     const apiKeyEnv = credentialRefOf(this.sectionValue('apiKeyEnv')) ?? '';
     const activeAccount = typeof this.sectionValue('activeAccount') === 'string' ? (this.sectionValue('activeAccount') as string) : '';
     const modelSelection = modelSelectionOf(this.sectionValue('modelSelection'));
+    const concurrency = normalizeConcurrency(this.sectionValue('concurrency'));
+    const effectiveActiveAccountId = this.effectiveActiveAccountId(activeAccount, defaultView?.configured ?? false);
 
     const dirty =
       this.stagedApiBase !== undefined ||
       this.stagedApiKeyEnv !== undefined ||
       this.stagedActiveAccount !== undefined ||
+      this.stagedConcurrency !== undefined ||
       this.stagedModelSelectionInclude !== undefined ||
       this.stagedModelSelectionExclude !== undefined ||
       this.defaultKeyDraft !== '' ||
@@ -321,6 +343,9 @@ export class SenseNovaSettingsController {
       accounts,
       activeAccount,
       activeAccountDraft: this.stagedActiveAccount ?? activeAccount,
+      effectiveActiveAccountId,
+      concurrency,
+      concurrencyDraft: this.stagedConcurrency ?? String(concurrency),
       modelSelectionInclude: modelSelection.include,
       modelSelectionExclude: modelSelection.exclude,
       modelSelectionIncludeDraft: this.stagedModelSelectionInclude ?? modelSelection.include.join('\n'),
@@ -330,6 +355,23 @@ export class SenseNovaSettingsController {
       failed: this.failed,
       savedCount: this.savedCount,
     };
+  }
+
+  /**
+   * 计算当前实际生效账户 id：
+   * - 显式钉选（activeAccount 非空且指向已保存账户）→ 该 id；
+   * - 自动模式 → 默认账户已配置取 'default'，否则第一个已配置账户行 id，均无则 ''。
+   * UI 据此展示「活动/当前」标记（运行时 401 禁用后的顺延以实际可用账号为准）。
+   */
+  private effectiveActiveAccountId(activeAccount: string, defaultConfigured: boolean): string {
+    if (activeAccount !== '') {
+      const pinned = this.effectiveAccounts().find((a) => a.id === activeAccount);
+      if (pinned !== undefined && pinned.configured) return pinned.id;
+      // 钉选账户未配置时视为自动。
+    }
+    if (defaultConfigured) return 'default';
+    const firstConfigured = this.effectiveAccounts().find((a) => a.configured);
+    return firstConfigured !== undefined ? firstConfigured.id : '';
   }
 
   /** 合并 stored（减 staged 删除）与 staged 新增，得到展示用账户行。 */
@@ -360,6 +402,7 @@ export class SenseNovaSettingsController {
     if (field === 'apiBase') this.stagedApiBase = text;
     else if (field === 'apiKeyEnv') this.stagedApiKeyEnv = text;
     else if (field === 'activeAccount') this.stagedActiveAccount = text;
+    else if (field === 'concurrency') this.stagedConcurrency = text;
     else if (field === 'modelSelectionInclude') this.stagedModelSelectionInclude = text;
     else this.stagedModelSelectionExclude = text;
     this.failed = false;
@@ -454,6 +497,7 @@ export class SenseNovaSettingsController {
     this.stagedApiBase = undefined;
     this.stagedApiKeyEnv = undefined;
     this.stagedActiveAccount = undefined;
+    this.stagedConcurrency = undefined;
     this.stagedModelSelectionInclude = undefined;
     this.stagedModelSelectionExclude = undefined;
     this.defaultKeyDraft = '';
@@ -596,6 +640,10 @@ export class SenseNovaSettingsController {
       if (this.stagedActiveAccount !== undefined) {
         if (this.stagedActiveAccount === '') await this.scope.unset('activeAccount');
         else await this.scope.set('activeAccount', this.stagedActiveAccount);
+      }
+      if (this.stagedConcurrency !== undefined) {
+        const value = normalizeConcurrency(this.stagedConcurrency);
+        await this.scope.set('concurrency', value);
       }
       if (this.stagedModelSelectionInclude !== undefined || this.stagedModelSelectionExclude !== undefined) {
         const current = modelSelectionOf(this.sectionValue('modelSelection'));

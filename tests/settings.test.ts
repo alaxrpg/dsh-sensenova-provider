@@ -139,3 +139,108 @@ test('SenseNovaSettingsController: credential-ref trim/校验阻止非法引用�
   assert.equal(calls.unset, 0);
   controller.dispose();
 });
+
+test('SenseNovaSettingsController: 并发上限 staged 保存与非法值回退 1', async () => {
+  let value: SenseNovaConfig = {};
+  const listeners = new Set<() => void>();
+  const scope: SettingsScope<SenseNovaConfig> = {
+    getSnapshot: () => ({ status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' }),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async set(field, next) {
+      value = { ...value, [field]: next } as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+    async unset(field) {
+      const next = { ...value } as Record<string, unknown>;
+      delete next[field];
+      value = next as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+  };
+  const credentials: CredentialsFace = {
+    describe: async () => ({ ok: true, value: {} }),
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+  const controller = new SenseNovaSettingsController(scope, credentials);
+  assert.equal(controller.state().concurrency, 1, '缺省并发上限 1');
+  assert.equal(controller.state().concurrencyDraft, '1');
+
+  controller.edit('concurrency', '4');
+  assert.equal(controller.state().dirty, true);
+  assert.equal(controller.state().concurrencyDraft, '4');
+  await controller.save();
+  assert.equal(value.concurrency, 4, '合法正整数保存');
+
+  controller.edit('concurrency', '0');
+  await controller.save();
+  assert.equal(value.concurrency, 1, '非法值（0）保存时回退 1');
+  controller.dispose();
+});
+
+test('SenseNovaSettingsController: effectiveActiveAccountId 派生', async () => {
+  let value: SenseNovaConfig = {};
+  // 默认账户（SENSENOVA_API_KEY）的配置状态按场景切换；额外账户恒为已配置。
+  let defaultConfigured = true;
+  const listeners = new Set<() => void>();
+  const scope = (): SettingsScope<SenseNovaConfig> => ({
+    getSnapshot: () => ({ status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' }),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async set(field, next) {
+      value = { ...value, [field]: next } as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+    async unset(field) {
+      const next = { ...value } as Record<string, unknown>;
+      delete next[field];
+      value = next as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+  });
+  const credentials: CredentialsFace = {
+    describe: async (refs) => ({
+      ok: true,
+      value: Object.fromEntries(refs.map((ref) => [
+        ref,
+        { configured: ref === 'SENSENOVA_API_KEY' ? defaultConfigured : true, writable: true },
+      ])),
+    }),
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+  const controller = new SenseNovaSettingsController(scope(), credentials);
+  await controller.refreshCredentials();
+  // 默认账户已配置、无额外账户 → 'default'
+  assert.equal(controller.state().effectiveActiveAccountId, 'default', '默认账户已配置时自动取 default');
+
+  // 默认未配置、第一个账户已配置 → 该账户 id
+  defaultConfigured = false;
+  value = { accounts: [{ id: 'account-2', label: 'Secondary', apiKeyEnv: 'SENSENOVA_API_KEY_2' }] };
+  await controller.refreshCredentials();
+  assert.equal(controller.state().effectiveActiveAccountId, 'account-2', '默认未配置时取第一个已配置账户');
+
+  // 钉选账户：activeAccount 指向已配置账户 → 该 id
+  value = {
+    accounts: [{ id: 'account-2', label: 'Secondary', apiKeyEnv: 'SENSENOVA_API_KEY_2' }],
+    activeAccount: 'account-2',
+  };
+  await controller.refreshCredentials();
+  assert.equal(controller.state().effectiveActiveAccountId, 'account-2', '钉选账户生效');
+
+  // 全未配置 → ''
+  defaultConfigured = false;
+  value = { accounts: [{ id: 'account-2', label: 'Secondary', apiKeyEnv: 'SENSENOVA_API_KEY_2' }] };
+  const credentialsNone: CredentialsFace = {
+    describe: async (refs) => ({
+      ok: true,
+      value: Object.fromEntries(refs.map((ref) => [ref, { configured: false, writable: true }])),
+    }),
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+  const controllerNone = new SenseNovaSettingsController(scope(), credentialsNone);
+  await controllerNone.refreshCredentials();
+  assert.equal(controllerNone.state().effectiveActiveAccountId, '', '无已配置账户时为空');
+  controller.dispose();
+  controllerNone.dispose();
+});

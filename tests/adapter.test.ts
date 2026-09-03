@@ -300,6 +300,14 @@ test('resolveAdapterOptions: 非法 credential-ref 不保留原文且不作为�
   assert.equal(valid.accounts[0]?.ref, 'SENSENOVA_API_KEY');
 });
 
+test('resolveAdapterOptions: concurrency 缺省 1，非正整数回退 1', () => {
+  assert.equal(resolveAdapterOptions({}).concurrency, 1);
+  assert.equal(resolveAdapterOptions({ concurrency: 3 }).concurrency, 3);
+  assert.equal(resolveAdapterOptions({ concurrency: 0 }).concurrency, 1);
+  assert.equal(resolveAdapterOptions({ concurrency: -1 }).concurrency, 1);
+  assert.equal(resolveAdapterOptions({ concurrency: 2.5 }).concurrency, 1);
+});
+
 test('listModels: 无 key 时返回空目录不阻塞', async () => { 
   const adapter = new SensenovaAdapter({
     options: () => CONNECTION,

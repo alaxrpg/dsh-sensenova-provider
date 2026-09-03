@@ -49,6 +49,8 @@ export interface SensenovaConfig {
   accounts?: SensenovaAccountConfig[];
   activeAccount?: string;
   modelSelection?: { include?: string[]; exclude?: string[] };
+  /** 每 key 并发生成请求上限（正整数，默认 1）。 */
+  concurrency?: number;
 }
 
 export const Config: z<SensenovaConfig> = z.object({
@@ -64,6 +66,7 @@ export const Config: z<SensenovaConfig> = z.object({
     include: z.array(z.string()).default([]),
     exclude: z.array(z.string()).default([]),
   }),
+  concurrency: z.natural().min(1).default(1),
 });
 
 /** 一个解析后的账户槽位：id/label + 合法 credential-ref 名。 */
@@ -81,7 +84,13 @@ export interface ResolvedSensenovaOptions {
   apiBase: string;
   activeAccount: string;
   accounts: ResolvedAccountSpec[];
+  concurrency: number;
   modelSelection?: ModelSelection;
+}
+
+/** 把配置的并发上限归一化为正整数（非正整数/无法解析回退 1）。 */
+export function normalizeConcurrency(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : 1;
 }
 
 /** 领域层规范化模型 id：去除首尾空白、过滤空项、稳定去重。 */
@@ -140,6 +149,7 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     apiBase: config.apiBase ?? DEFAULT_API_BASE,
     activeAccount: typeof config.activeAccount === 'string' ? config.activeAccount : '',
     accounts,
+    concurrency: normalizeConcurrency(config.concurrency),
     ...(modelSelection !== undefined ? { modelSelection } : {}),
   };
 }
@@ -213,6 +223,7 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
       return {
         apiBase: resolved.apiBase,
         accountCount: resolved.accounts.length,
+        concurrency: resolved.concurrency,
         ...(resolved.modelSelection !== undefined ? { modelSelection: resolved.modelSelection } : {}),
       };
     },
