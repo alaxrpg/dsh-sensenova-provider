@@ -8,7 +8,7 @@
 
 默认（`quotaRotation` 关闭）时，429 SHALL NOT 切换到其他账号，一个会话固定使用一个 key。系统 SHALL 提供「配额类 429 换 key」设置开关（默认关闭，收纳于高级设置折叠区）：开启后，仅配额类 429 SHALL 触发切换到下一把可用 key 并粘住新 key（同一会话后续请求继续使用新 key），环回一圈仍被配额类 429 拒绝时 SHALL 停留在当前 key 按退避下限等待；非配额类 429 在任何设置下 SHALL NOT 触发轮换。
 
-对配额类 429，系统 SHALL 以 `RATE_LIMIT` 错误结束本次请求，并 SHALL 携带与配额窗口匹配的 `providerRetryAfterMs` 作为退避下限指导：速率类（code 8）默认不低于 15000 毫秒，TPM 类（code 429001）默认不低于 60000 毫秒；当响应携带 `Retry-After` 且换算毫秒值大于上述默认下限时，SHALL 采用 `Retry-After` 值，且采用值整体 SHALL NOT 超过 120000 毫秒（超出时按 120000 毫秒采用）。对非配额类 429（无 `error.code` 或其他 code），系统 SHALL 维持既有行为：`Retry-After` 在大于 0 且不超过重试策略单次延迟上限（见「Provider 重试策略」）时透传，否则不透传也不截断，由宿主本地退避策略计算。
+对配额类 429，系统 SHALL 以 `RATE_LIMIT` 错误结束本次请求，并 SHALL 携带 `providerRetryAfterMs` 作为退避指导：速率类（code 8）为固定下限 15000 毫秒；TPM 类（code 429001）采用分级探测退避，档位 SHALL 随该会话连续命中次数递增为 3000 → 5000 → 10000 → 15000 毫秒后封顶，任一请求成功或切换到新 key 后 SHALL 归零重新从 3000 毫秒开始（2026-09-04 实测：429001 为 per-key 推理 token 限速，恢复时间不定，固定长下限会把会话干锁在死等；短档位递增探测 + 优先换 key 才能在恢复第一时间接上）。当响应携带 `Retry-After` 且换算毫秒值大于当前档位时，SHALL 采用 `Retry-After` 值，且采用值整体 SHALL NOT 超过 300000 毫秒（超出时按 300000 毫秒采用）。对非配额类 429（无 `error.code` 或其他 code），系统 SHALL 维持既有行为：`Retry-After` 在大于 0 且不超过重试策略单次延迟上限（见「Provider 重试策略」）时透传，否则不透传也不截断，由宿主本地退避策略计算。
 
 #### Scenario: 429 不轮换不冷却
 
@@ -30,10 +30,15 @@
 - **WHEN** 某账号请求收到 429 且错误体为 `{"error":{"message":"rpm exhausted","type":"quota_exceeded_error","code":"8"}}`（响应无 `Retry-After` 头）
 - **THEN** 系统不标记冷却、不切换账号，以 `RATE_LIMIT` 错误结束本次请求，且错误携带 `providerRetryAfterMs` 不低于 15000 毫秒
 
-#### Scenario: TPM 耗尽给出更高退避下限
+#### Scenario: TPM 耗尽给出分级探测退避
 
-- **WHEN** 某账号请求收到 429 且错误体包含 `error.code` 为 `429001`（inference tpm exhausted）
-- **THEN** 系统以 `RATE_LIMIT` 错误结束本次请求且不轮换账号，错误携带 `providerRetryAfterMs` 不低于 60000 毫秒
+- **WHEN** 某账号请求收到 429 且错误体包含 `error.code` 为 `429001`（inference tpm exhausted），且该会话此前已连续命中 n 次
+- **THEN** 系统以 `RATE_LIMIT` 错误结束本次请求且不轮换账号，错误携带 `providerRetryAfterMs` 为分级档位第 min(n+1, 4) 档（3000/5000/10000/15000 毫秒）
+
+#### Scenario: TPM 分级档位成功后归零
+
+- **WHEN** 某会话经历 429001 分级退避后任一请求成功
+- **THEN** 该会话的连续命中计数归零，下一次 429001 退避从 3000 毫秒重新开始
 
 #### Scenario: 短 Retry-After 透传
 
@@ -52,7 +57,7 @@
 
 ### Requirement: Provider 重试策略
 
-系统 SHALL 为 `sensenova` 路由声明 `normal` 重试策略：最大重试次数 SHALL 为有限值且默认不超过 10 次；本地指数退避单次延迟上限 SHALL 提升到至少 60000 毫秒（60000 毫秒 ≤ 上限 ≤ 120000 毫秒），以匹配配额类 429 的窗口量级；收到配额类 429（见「429 不冷却不轮换」）后的下一次重试延迟 SHALL 不低于该错误携带的 `providerRetryAfterMs`。对非配额类 429，服务端提供的 `Retry-After` 超过单次延迟上限时 SHALL NOT 作为 provider 延迟透传，也不得截断后透传，改由本地策略计算；配额类的 `Retry-After` 采用规则见「429 不冷却不轮换」。429 不产生账号冷却。
+系统 SHALL 为 `sensenova` 路由声明 `normal` 重试策略：最大重试次数 SHALL 为有限值且默认不超过 10 次；本地指数退避单次延迟上限 SHALL 不低于 60000 毫秒且不超过 300000 毫秒（60000 毫秒 ≤ 上限 ≤ 300000 毫秒）。收到配额类 429（见「429 不冷却不轮换」）后的下一次重试延迟 SHALL 不低于该错误携带的 `providerRetryAfterMs`（TPM 类为该会话当前分级探测档位，code 8 为 15000 毫秒）。对非配额类 429，服务端提供的 `Retry-After` 超过单次延迟上限时 SHALL NOT 作为 provider 延迟透传，也不得截断后透传，改由本地策略计算；配额类的 `Retry-After` 采用规则见「429 不冷却不轮换」。429 不产生账号冷却。
 
 #### Scenario: 持续限流时重试预算有限
 
@@ -61,8 +66,8 @@
 
 #### Scenario: 配额类退避下限被遵守
 
-- **WHEN** 某次配额类 429 携带 `providerRetryAfterMs` 60000 毫秒
-- **THEN** 下一次重试的实际延迟不低于 60000 毫秒，本地指数退避在达到单次延迟上限后不再增长
+- **WHEN** 某次配额类 429 携带 `providerRetryAfterMs` 10000 毫秒（TPM 分级第 3 档）
+- **THEN** 下一次重试的实际延迟不低于 10000 毫秒，本地指数退避在达到单次延迟上限后不再增长
 
 #### Scenario: 限流时按策略重试
 

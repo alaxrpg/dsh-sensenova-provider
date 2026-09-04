@@ -30,13 +30,13 @@ D0/D1 实测补充两条新事实（除 proposal 已列外）：
 
 配额类 = `code === 8`（`rps/rpm exhausted`）或 `code === 429001`（`inference tpm exhausted`）；其余（含无 code）归非配额类，维持现行短退避语义。备选方案「按 message 正则分类」被否：message 措辞随版本漂移（实测同 code 8 出现过 `rps exhausted` 与 `rpm exhausted` 两种），code 更稳定。「按官方错误表的 `type` 分类」同样被否：官方表将 429 统一标为 `quota_exceeded_error`，但实测 `429001` 的 `type` 实为 `invalid_request_error`（09-02 与 09-04 两次现场一致），按 type 分类会漏掉 TPM 类。
 
-### D2: 配额类退避下限——code 8 取 15000ms、429001 取 60000ms，`Retry-After` 优先
+### D2: 配额类退避——code 8 固定 15000ms，429001 分级探测 3/5/10/15s 递增封顶、成功归零
 
-依据：速率桶补充 ≈1 个/14 秒（15s 覆盖一个完整补充周期）；TPM 为 60 秒窗口（60s 覆盖一次完整翻转）。实测 429 响应无 `Retry-After` 头，但保留「响应携带且大于默认下限时采用 `Retry-After`」的规则以兼容网关行为变化；配额类采用值整体封顶 120000ms（spec 允许区间上沿），防止异常 `Retry-After` 突破区间。实现为 `providerRetryAfterMs` 附加在 `RATE_LIMIT` 错误上，交宿主重试层执行。
+依据：速率桶补充 ≈1 个/14 秒（15s 覆盖一个完整补充周期），code 8 固定 15s；429001 为 per-key 推理 token 限速（2026-09-04 实测 key A 30k 请求 429001、key B 同刻通过；官方文档将 429 统一标注 quota_exceeded_error 建议指数退避，未公开数值），恢复时间不定——**固定长下限（60s/180s）会把会话干锁在死等里**，故采用分级探测：连续命中档位 3s→5s→10s→15s 封顶，任一成功或换 key 归零回到 3s，恢复第一时间接上；开 `quotaRotation` 时优先换 key（实测换 key 秒级成功）。实测 429 响应无 `Retry-After` 头，但保留「响应携带且大于当前档位时采用 `Retry-After`」的规则以兼容网关行为变化；采用值整体封顶 300000ms。实现为 `providerRetryAfterMs` 附加在 `RATE_LIMIT` 错误上，交宿主重试层执行。
 
 ### D3: `providerRetryPolicy` 收敛为 `maxRetries: 10`、退避单次上限 60000ms
 
-`maxRetries` 取 10：配额类场景 10 次 × 15–60s 退避（约 3–10 分钟）已覆盖可预期的恢复窗口，超出则应显式失败。上限取 60000ms（spec 允许区间 60–120s 的下沿）：与 TPM 窗口对齐，同时避免单次等待过长放大交互卡顿。备选「维持 1000 次但延长上限」被否：重试预算不收敛时 UI 仍呈「无限重试」，违背本变更目标。
+`maxRetries` 取 10：配合 429001 分级探测（最长 15s/档）与 code 8 固定 15s，10 次重试预算已覆盖可预期的恢复窗口，超出则应显式失败。本地退避单次上限取 60000ms：为无 `providerRetryAfterMs` 指导时的本地指数退避封顶；TPM 分级档经 `providerRetryAfterMs` 通道单独下发（宿主按该指导延迟）。备选「维持 1000 次但延长上限」被否：重试预算不收敛时 UI 仍呈「无限重试」，违背本变更目标。
 
 ### D4: 三段超时——连接/首字节 45s、流空闲 60s、排队 60s，超时以可重试 `TIMEOUT` 结束并释放额度
 

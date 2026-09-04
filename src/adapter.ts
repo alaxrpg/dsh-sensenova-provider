@@ -54,13 +54,12 @@ const MODELS_TIMEOUT_MS = 10_000;
  * 不符——TPM 为 60 秒窗口，提升到 60000ms（spec 允许区间 60–120s 的下沿）。
  */
 const PROVIDER_RETRY_AFTER_CAP_MS = 60_000;
-/** 配额类 429 退避指导（providerRetryAfterMs）的绝对上限（毫秒）：spec 允许区间 60–120s 的上沿，
- * 防止网关异常 Retry-After 把退避拖到分钟级以外（design D2）。 */
-const QUOTA_RETRY_AFTER_CEILING_MS = 120_000;
+/** 配额类 429 退避指导（providerRetryAfterMs）的绝对上限（毫秒）：宽松上限，
+ * 防止网关异常 Retry-After 把退避拖到分钟级以外；不影响 TPM 分级档（3–15s）与
+ * code 8 固定档（15s）的正常取值。 */
+const QUOTA_RETRY_AFTER_CEILING_MS = 300_000;
 /** 配额类 429（code 8，rps/rpm exhausted）退避下限（毫秒）。2026-09-04 实测：速率桶补充 ≈1 个/14s，15s 覆盖一个完整补充周期。 */
 export const QUOTA_RATE_RETRY_FLOOR_MS = 15_000;
-/** 配额类 429（code 429001，inference tpm exhausted）退避下限（毫秒）。2026-09-04 实测：TPM 按 60 秒窗口翻转。 */
-export const QUOTA_TPM_RETRY_FLOOR_MS = 60_000;
 /** 生成请求连接/首字节超时（毫秒）。2026-09-04 实测：传输挂起 ≈1/5 且无 RST，45s 覆盖大 prompt 建连+首包（design D4/D6）。 */
 export const CONNECT_TIMEOUT_MS = 45_000;
 /** SSE 流空闲看门狗（毫秒）：距上一事件 ≥ 该值无任何 chunk/事件即按停摆结束。2026-09-04 实测：思考期渠道有空事件/心跳自然重置计时（design D4/D6）。 */
@@ -774,7 +773,18 @@ function isTimeoutReason(value: unknown): value is Error {
 export interface RateLimit429Classification {
   quota: boolean;
   retryFloorMs: number | undefined;
+  /** 配额子类：'rate'（code 8 速率桶）或 'tpm'（code 429001 推理 token 限速）。 */
+  kind: 'rate' | 'tpm' | undefined;
 }
+
+/**
+ * 429001 分级探测退避档位（毫秒）——2026-09-04 定稿：不设长固定下限（60s/180s 均会
+ * 把用户干锁在死等里），而是每次宿主重试各自重新探测，等待随连续 429001 次数递增
+ * 3s → 5s → 10s → 15s 后封顶（每轮重置、不继承：任一成功即清零，恢复后立即回到 3s）。
+ * 官方文档将 429 统一标注为 quota_exceeded_error 且建议「指数退避重试」，未公开数值；
+ * 实测 key A 30k 请求 429001、key B 同刻通过 → per-key 限速差异，短探测 + 换 key 优先。
+ */
+export const TPM_PROBE_BACKOFF_STEPS_MS: readonly number[] = [3_000, 5_000, 10_000, 15_000];
 
 /**
  * 解析 429 响应体并按 error.code 二分类（design D1，2026-09-04 实测）：
@@ -790,18 +800,20 @@ export function classify429Body(bodyText: string): RateLimit429Classification {
   try {
     parsed = JSON.parse(bodyText);
   } catch {
-    return { quota: false, retryFloorMs: undefined };
+    return { quota: false, retryFloorMs: undefined, kind: undefined };
   }
-  if (!isRecord(parsed) || !isRecord(parsed.error)) return { quota: false, retryFloorMs: undefined };
+  if (!isRecord(parsed) || !isRecord(parsed.error)) return { quota: false, retryFloorMs: undefined, kind: undefined };
   const code = parsed.error.code;
-  if (typeof code !== 'number' && typeof code !== 'string') return { quota: false, retryFloorMs: undefined };
-  if (code === 8 || code === '8') return { quota: true, retryFloorMs: QUOTA_RATE_RETRY_FLOOR_MS };
-  if (code === 429001 || code === '429001') return { quota: true, retryFloorMs: QUOTA_TPM_RETRY_FLOOR_MS };
-  return { quota: false, retryFloorMs: undefined };
+  if (typeof code !== 'number' && typeof code !== 'string') return { quota: false, retryFloorMs: undefined, kind: undefined };
+  if (code === 8 || code === '8') return { quota: true, retryFloorMs: QUOTA_RATE_RETRY_FLOOR_MS, kind: 'rate' };
+  if (code === 429001 || code === '429001') return { quota: true, retryFloorMs: TPM_PROBE_BACKOFF_STEPS_MS[0], kind: 'tpm' };
+  return { quota: false, retryFloorMs: undefined, kind: undefined };
 }
 
-/** 把预流 HTTP 失败映射为稳定 LlmError。 */
-function httpError(status: number, errText: string, retryAfterMs: number | undefined): LlmError {
+/** 把预流 HTTP 失败映射为稳定 LlmError。
+ * dynamicFloorMs：stream 层算好的配额类动态退避下限（429001 分级探测），
+ * 覆盖 classify429Body 返回的静态 floor；undefined 时用静态 floor。 */
+function httpError(status: number, errText: string, retryAfterMs: number | undefined, dynamicFloorMs?: number): LlmError {
   if (status === 401) {
     return new LlmError(
       'llm-sensenova: SenseNova API error 401 — the API key is missing or invalid；SenseNova API 返回 401：密钥缺失或无效',
@@ -817,18 +829,20 @@ function httpError(status: number, errText: string, retryAfterMs: number | undef
     );
   }
   if (status === 429) {
-    // SenseNova 429 按 error.code 二分类（design D1/D2，2026-09-04 实测）：
-    // 配额类（code 8 速率耗尽 / 429001 TPM 耗尽）携带退避下限 providerRetryAfterMs
-    // （速率 15s≈一个桶补充周期，TPM 60s 窗口）；响应 Retry-After 大于下限时优先采用。
+    // SenseNova 429 按 error.code 二分类（design D1，2026-09-04 实测）：
+    // 配额类（code 8 速率耗尽 / 429001 TPM 耗尽）携带退避下限 providerRetryAfterMs；
+    // 429001 用 stream 层算好的分级探测档（dynamicFloorMs：3/5/10/15s，成功清零），
+    // code 8 用静态 floor（15s≈一个桶补充周期）。响应 Retry-After 大于下限时优先采用，
+    // 但整体封顶（防异常 Retry-After 把退避拖到分钟级外）。
     // 非配额类维持现行短退避语义：Retry-After <= 上限时透传，超长整值不透传
     // （也不截断），由宿主本地退避策略计算。任何 429 都不轮换、不冷却账号。
     const classified = classify429Body(errText);
+    const floorMs = dynamicFloorMs ?? classified.retryFloorMs;
     let providerRetryAfterMs: number | undefined;
-    if (classified.retryFloorMs !== undefined) {
-      // 配额类：退避下限生效，Retry-After 更大时优先（design D2，不受非配额类透传上限约束），
-      // 整体封顶 120s（QUOTA_RETRY_AFTER_CEILING_MS），避免异常 Retry-After 突破 spec 区间上沿。
+    if (floorMs !== undefined) {
+      // 配额类：退避下限生效，Retry-After 更大时优先，整体封顶 300s（宽松上限）。
       providerRetryAfterMs = Math.min(
-        Math.max(classified.retryFloorMs, retryAfterMs !== undefined && retryAfterMs > 0 ? retryAfterMs : 0),
+        Math.max(floorMs, retryAfterMs !== undefined && retryAfterMs > 0 ? retryAfterMs : 0),
         QUOTA_RETRY_AFTER_CEILING_MS,
       );
     } else {
@@ -862,11 +876,10 @@ export class SensenovaAdapter extends LlmAdapter {
    */
   private readonly quotaStickyKeys = new Map<string | undefined, string>();
   /**
-   * 配额轮换「已环回」标记（design D5）：某会话按序试完所有可用 key 均被配额类
-   * 429 拒绝后记录，后续请求停留在当前 key 按退避下限等待、不再轮换，避免双 key
-   * 都饱和时宿主每轮重试都乒乓切换；该会话任一请求成功（配额恢复）后清除。
+   * 429001 连续命中计数（per-session，分级探测用）：命中 +1、成功/换 key 清零，
+   * 决定下次探测档位 TPM_PROBE_BACKOFF_STEPS_MS[count]。仅内存，随适配器生命周期。
    */
-  private readonly quotaRingExhausted = new Set<string | undefined>();
+  private readonly tpmHitCounts = new Map<string | undefined, number>();
 
   constructor(deps: SensenovaAdapterDeps) {
     super();
@@ -1027,8 +1040,8 @@ export class SensenovaAdapter extends LlmAdapter {
         }
         if (attempt.ok) {
           response = attempt;
-          // 配额已恢复：清除该会话的环回标记，未来配额类 429 可再次轮换。
-          if (quotaRotation) this.quotaRingExhausted.delete(options.sessionId);
+          // 请求成功：429001 分级探测计数归零（下次再限流从最短档 3s 重新探测）。
+          this.tpmHitCounts.delete(options.sessionId);
           break; // 额度随 response 保留，由外层 finally 在流结束后释放
         }
         const errText = await attempt.text().catch(() => '');
@@ -1045,13 +1058,23 @@ export class SensenovaAdapter extends LlmAdapter {
         // （一个会话固定使用一个 key，保护服务端按 key 命中的 prompt 缓存），直接抛
         // RATE_LIMIT 交宿主重试层自动退避后原 key 重试。quotaRotation 开启时，仅
         // 配额类 429（error.code 8 / 429001）粘性切换到下一把未试过的 key 重试本次
-        // 请求（design D5）；环回无新 key 则停留在当前 key 抛 RATE_LIMIT。401 轮换
-        // 路径不变。并发闸已在源头抑制并发超限，此处为兜底。
+        // 请求；环回无新 key 则停留在当前 key 抛 RATE_LIMIT。401 轮换路径不变。
+        // 并发闸已在源头抑制并发超限，此处为兜底。
         const classified = classify429Body(errText);
         const quota429 = attempt.status === 429 && classified.quota;
-        // 已环回的会话不再轮换（design D5）：停留在当前 key 抛 RATE_LIMIT 交宿主按
-        // 退避下限等待，避免双 key 都饱和时宿主每轮重试都乒乓切换。
-        const quotaRotate = quota429 && quotaRotation && !this.quotaRingExhausted.has(options.sessionId);
+        // 429001 分级探测档位：连续命中计数决定本次退避（3/5/10/15s，封顶后保持），
+        // 命中即 +1——每次宿主重试都带一个递增的探测等待，成功后清零回到最短档。
+        let dynamicFloorMs: number | undefined;
+        if (classified.kind === 'tpm') {
+          const hits = this.tpmHitCounts.get(options.sessionId) ?? 0;
+          dynamicFloorMs = TPM_PROBE_BACKOFF_STEPS_MS[Math.min(hits, TPM_PROBE_BACKOFF_STEPS_MS.length - 1)];
+          this.tpmHitCounts.set(options.sessionId, hits + 1);
+        }
+        // 配额类 429 且开关开启：轮换到下一把本请求未试过的 key（tried 集合做单次
+        // 请求内防乒乓——每次宿主重试都会清空 tried、重新探测各 key，因此配额恢复
+        // 或另一把 key 空闲时下一次重试即可切过去；不再用跨请求环回 Set，那会把
+        // 会话永久锁死在已耗尽的 key 上干等退避）。
+        const quotaRotate = quota429 && quotaRotation;
         const rotatable = attempt.status === 401 || quotaRotate;
         if (rotatable && options.signal?.aborted !== true && rotations < connection.accountCount) {
           // 'quota-exhausted' 不写任何账号状态；401 仍走禁用轮换。
@@ -1067,16 +1090,14 @@ export class SensenovaAdapter extends LlmAdapter {
             rotations += 1;
             if (quotaRotate) {
               this.quotaStickyKeys.set(options.sessionId, next); // 粘住新 key
-              this.quotaRingExhausted.delete(options.sessionId); // 新 key 配额新鲜
+              this.tpmHitCounts.delete(options.sessionId); // 新 key 配额新鲜，探测档位归零
             }
             continue;
           }
         }
-        // 配额类 429 无可切换的新 key（环回）：记录环回状态后停留在当前 key 抛错。
-        if (quota429 && quotaRotation) this.quotaRingExhausted.add(options.sessionId);
         release();
         release = undefined;
-        throw httpError(attempt.status, errText, retryAfterMs);
+        throw httpError(attempt.status, errText, retryAfterMs, dynamicFloorMs);
       }
 
       if (response === undefined) {
