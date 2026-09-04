@@ -93,6 +93,11 @@ function accountDisplayLabel(
     : t('accountFallback', { index: index + 1 });
 }
 
+/** 分组标题：引导后续卡片的分区归属。 */
+function SectionHeading(props: { text: string }): JSX.Element {
+  return <h3 className="sn-groupTitle">{props.text}</h3>;
+}
+
 function AdvancedSettings(props: {
   t: TranslateFn;
   state: SettingsState;
@@ -223,8 +228,9 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
         </p>
       ) : null}
 
-      {/* Provider 路由信息 */}
-      <div className="sn-card">
+      {/* 分组 1：接入信息 */}
+      <SectionHeading text={t('groupConnection')} />
+      <div className="sn-card sn-cardCompact">
         <div className="sn-field">
           <div className="sn-fieldHead">
             <span className="sn-label">{t('routeLabel')}</span>
@@ -232,36 +238,59 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
               <span className="sn-badge">{state.route}</span>
             </span>
           </div>
-          <p className="sn-hint">
-            {state.displayName} · {state.route}
-          </p>
+          <p className="sn-hint">{state.displayName}</p>
         </div>
       </div>
 
-      {/* 默认账户 */}
+      {/* 分组 2：凭据与账户 */}
+      <SectionHeading text={t('groupCredentials')} />
       <div className="sn-card">
+        <div className="sn-field">
+          <div className="sn-fieldHead">
+            <span className="sn-label">{t('defaultAccount')}</span>
+            <span className="sn-badges">
+              {state.effectiveActiveAccountId === 'default' ? (
+                <span className="sn-badge sn-badgeActive">{t('activeBadgeEffectiveFull')}</span>
+              ) : null}
+              <StatusBadge configured={state.defaultConfigured} t={t} />
+            </span>
+          </div>
+        </div>
         <DefaultKeyField
           t={t}
           draft={state.defaultKeyDraft}
           disabled={disabled || !state.defaultWritable}
           configured={state.defaultConfigured}
           clearStaged={state.defaultClearStaged}
-          isEffective={state.effectiveActiveAccountId === 'default'}
           onEdit={props.editDefaultKey}
           onToggleClear={props.toggleDefaultKeyClear}
         />
       </div>
 
-      {/* 多账户列表 */}
       <div className="sn-card">
         <div className="sn-field">
           <div className="sn-fieldHead">
             <span className="sn-label">{t('accountsTitle')}</span>
-            <button type="button" className="sn-reset" disabled={disabled} onClick={props.addAccount}>
+            <button type="button" className="sn-btnAdd" disabled={disabled} onClick={props.addAccount}>
               {t('accountAdd')}
             </button>
           </div>
           <p className="sn-hint">{t('accountsHint')}</p>
+        </div>
+
+        {/* 账户总览条：一目了然显示总数、已配置数、当前生效账户 */}
+        <div className="sn-accountSummary">
+          <span className="sn-accountSummaryStats">
+            {t('accountSummary', { total: state.totalCount, configured: state.configuredCount })}
+          </span>
+          {state.effectiveActiveAccountLabel !== '' ? (
+            <span className="sn-accountSummaryActive">
+              <span className="sn-dotPulse" aria-hidden="true" />
+              {t('accountSummaryActive', { label: state.effectiveActiveAccountLabel })}
+            </span>
+          ) : (
+            <span className="sn-accountSummaryNone">{t('accountSummaryNone')}</span>
+          )}
         </div>
 
         {/* 活动账户下拉：自动 + 已保存账户，未保存新增行不参与选择。 */}
@@ -278,7 +307,11 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
               disabled={disabled}
               onChange={(event: ChangeEventLike) => props.setActiveAccount(event.target.value)}
             >
-              <option value="">{t('activeAccountAuto')}</option>
+              <option value="">
+                {state.effectiveActiveAccountLabel !== ''
+                  ? `${t('activeAccountAuto')} → ${state.effectiveActiveAccountLabel}`
+                  : t('activeAccountAuto')}
+              </option>
               {savedAccounts.map((account, index) => (
                 <option key={account.id} value={account.id}>
                   {accountDisplayLabel(account, index, t, credentialRefs)}
@@ -320,6 +353,8 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
         ) : null}
       </div>
 
+      {/* 分组 3：高级选项 */}
+      <SectionHeading text={t('groupAdvanced')} />
       <AdvancedSettings t={t} state={state} disabled={disabled} edit={props.edit} />
 
       {/* 保存 / 重置 */}
@@ -329,13 +364,11 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
             <p className="sn-failed" role="status">
               {t('saveFailed')}
             </p>
-          ) : null}
-          {savedVisible && !state.dirty ? (
+          ) : savedVisible && !state.dirty ? (
             <p className="sn-saved" role="status">
               {t('saved')}
             </p>
-          ) : null}
-          {state.dirty ? (
+          ) : state.dirty ? (
             <span className="sn-unsaved">{t('unsaved')}</span>
           ) : null}
         </div>
@@ -358,7 +391,6 @@ function DefaultKeyField(props: {
   disabled: boolean;
   configured: boolean;
   clearStaged: boolean;
-  isEffective: boolean;
   onEdit: (text: string) => void;
   onToggleClear: () => void;
 }): JSX.Element {
@@ -371,9 +403,6 @@ function DefaultKeyField(props: {
           {t('defaultKey')}
         </label>
         <span className="sn-badges">
-          {props.isEffective ? (
-            <span className="sn-badge sn-badgeActive">{t('activeBadgeEffective')}</span>
-          ) : null}
           <button type="button" className="sn-reset" disabled={props.disabled} onClick={() => setVisible((v) => !v)}>
             {visible ? t('hide') : t('show')}
           </button>
@@ -429,7 +458,7 @@ function AccountRow(props: {
   const keyId = `sn-account-key-${account.id}`;
 
   return (
-    <div className="sn-accountRow">
+    <div className="sn-accountRow" data-sn-active={props.isActive ? 'true' : undefined}>
       <div className="sn-accountHead">
         <span className="sn-label" title={displayLabel}>{displayLabel}</span>
         <span className="sn-accountActions">
@@ -437,53 +466,70 @@ function AccountRow(props: {
             <StatusBadge configured={account.configured} t={t} />
             {props.isActive ? (
               <span className="sn-badge sn-badgeActive">
-                {props.isPinned ? t('activeBadge') : t('activeBadgeEffective')}
+                {props.isPinned ? t('activeBadge') : t('activeBadgeEffectiveFull')}
               </span>
             ) : null}
           </span>
           <button
             type="button"
-            className="sn-reset"
+            className="sn-iconBtn"
             disabled={props.disabled || !account.writable}
+            title={visible ? t('hide') : t('show')}
+            aria-label={visible ? t('hide') : t('show')}
             onClick={() => setVisible((v) => !v)}
           >
-            {visible ? t('hide') : t('show')}
+            {visible ? <IconEyeOff /> : <IconEye />}
           </button>
           {account.configured ? (
             <button
               type="button"
-              className="sn-reset"
+              className="sn-iconBtn"
               disabled={props.disabled || !account.writable}
+              title={t('clearKey')}
+              aria-label={t('clearKey')}
               onClick={props.onToggleClear}
             >
-              {t('clearKey')}
+              <IconEraser />
             </button>
           ) : null}
-          <button type="button" className="sn-reset" disabled={props.disabled} onClick={props.onRemove}>
-            {t('accountRemove')}
+          <button
+            type="button"
+            className="sn-iconBtn sn-iconBtnDanger"
+            disabled={props.disabled}
+            title={t('accountRemove')}
+            aria-label={t('accountRemove')}
+            onClick={props.onRemove}
+          >
+            <IconTrash />
           </button>
         </span>
       </div>
       <div className="sn-accountFields">
-        <input
-          id={labelId}
-          className="sn-input"
-          type="text"
-          placeholder={t('accountLabel')}
-          aria-label={t('accountLabel')}
-          value={labelDraft}
-          disabled={props.disabled}
-          spellCheck={false}
-          onChange={(event: ChangeEventLike) => props.onLabel(event.target.value)}
-        />
-        <div className="sn-accountKeyRow">
+        <div className="sn-accountField">
+          <label className="sn-labelSmall" htmlFor={labelId}>
+            {t('accountLabel')}
+          </label>
+          <input
+            id={labelId}
+            className="sn-input"
+            type="text"
+            placeholder={t('accountLabel')}
+            value={labelDraft}
+            disabled={props.disabled}
+            spellCheck={false}
+            onChange={(event: ChangeEventLike) => props.onLabel(event.target.value)}
+          />
+        </div>
+        <div className="sn-accountField">
+          <label className="sn-labelSmall" htmlFor={keyId}>
+            {t('accountKey')}
+          </label>
           <input
             id={keyId}
             className="sn-input"
             type={visible ? 'text' : 'password'}
             autoComplete="off"
             placeholder={t('accountKey')}
-            aria-label={t('accountKey')}
             spellCheck={false}
             value={account.keyDraft}
             disabled={props.disabled || !account.writable}
@@ -493,5 +539,41 @@ function AccountRow(props: {
         </div>
       </div>
     </div>
+  );
+}
+
+/** 行内 SVG 图标（currentColor，随主题变色）。 */
+function IconEye(): JSX.Element {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+      <path d="M1.5 8s2.2-3.6 6.5-3.6S14.5 8 14.5 8 12.3 11.6 8 11.6 1.5 8 1.5 8Z" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="8" cy="8" r="1.8" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
+}
+
+function IconEyeOff(): JSX.Element {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+      <path d="M1.5 8s2.2-3.6 6.5-3.6c1.5 0 2.8.5 3.8 1.2M14.5 8s-.8 1.3-2.4 2.5M6.6 11.3c.5.1.9.2 1.4.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M3 13 13 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconEraser(): JSX.Element {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+      <path d="M9.5 3.5 13.5 7.5 8 13H4.5L2.5 11c-.6-.6-.6-1.5 0-2.1l4.4-4.4c.6-.6 1.5-.6 2.1 0l.5.5Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      <path d="M6 13h8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconTrash(): JSX.Element {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+      <path d="M2.5 4h11M6.5 2.5h3M5 4l.5 8.5c0 .6.4 1 1 1h3c.6 0 1-.4 1-1L11 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   );
 }

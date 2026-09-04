@@ -116,6 +116,12 @@ export interface SettingsState {
   activeAccountDraft: string;
   /** 当前实际生效账户 id（'default' 指默认账户卡，'' 表示无已配置账户）。 */
   effectiveActiveAccountId: string;
+  /** 当前实际生效账户的可读标签（用于自动模式下展示「当前: xxx」）。 */
+  effectiveActiveAccountLabel: string;
+  /** 已配置（有可用密钥）的账户总数（含默认）。 */
+  configuredCount: number;
+  /** 账户总数（含默认账户，不含未保存新增行）。 */
+  totalCount: number;
   concurrency: number;
   concurrencyDraft: string;
   modelSelectionInclude: string[];
@@ -317,6 +323,9 @@ export class SenseNovaSettingsController {
     const modelSelection = modelSelectionOf(this.sectionValue('modelSelection'));
     const concurrency = normalizeConcurrency(this.sectionValue('concurrency'));
     const effectiveActiveAccountId = this.effectiveActiveAccountId(activeAccount, defaultView?.configured ?? false);
+    const effectiveActiveAccountLabel = this.effectiveActiveAccountLabel(effectiveActiveAccountId, accounts);
+    const configuredCount = (defaultView?.configured ? 1 : 0) + accounts.filter((a) => a.configured).length;
+    const totalCount = 1 + accounts.filter((a) => !a.added).length;
 
     const dirty =
       this.stagedApiBase !== undefined ||
@@ -350,6 +359,9 @@ export class SenseNovaSettingsController {
       activeAccount,
       activeAccountDraft: this.stagedActiveAccount ?? activeAccount,
       effectiveActiveAccountId,
+      effectiveActiveAccountLabel,
+      configuredCount,
+      totalCount,
       concurrency,
       concurrencyDraft: this.stagedConcurrency ?? String(concurrency),
       modelSelectionInclude: modelSelection.include,
@@ -378,6 +390,20 @@ export class SenseNovaSettingsController {
     if (defaultConfigured) return 'default';
     const firstConfigured = this.effectiveAccounts().find((a) => a.configured);
     return firstConfigured !== undefined ? firstConfigured.id : '';
+  }
+
+  /**
+   * 当前实际生效账户的可读标签：'default' → 「默认账户」，
+   * 其余取账户行 labelDraft（空则回退「账户 N」），无生效则 ''。
+   * 用于自动模式下下拉选项与总览条展示「当前: xxx」。
+   */
+  private effectiveActiveAccountLabel(id: string, accounts: AccountView[]): string {
+    if (id === '') return '';
+    if (id === 'default') return '默认账户';
+    const account = accounts.find((a) => a.id === id);
+    if (account === undefined) return id;
+    const label = account.labelDraft.trim();
+    return label !== '' ? label : `账户 ${accounts.indexOf(account) + 1}`;
   }
 
   /** 合并 stored（减 staged 删除）与 staged 新增，得到展示用账户行。 */
