@@ -39,7 +39,7 @@ import type {
   ToolResultBlock,
 } from '@deepseek-ai/dsh-llm';
 import { parseRetryAfterMs } from './accounts.ts';
-import { KeyedConcurrencyGate, type Release } from './concurrency.ts';
+import { DEFAULT_QUEUE_TIMEOUT_MS, KeyedConcurrencyGate, type Release } from './concurrency.ts';
 
 /**
  * SenseNova 目录通常不披露上下文字段，这里用 131072 作为合理默认
@@ -47,8 +47,24 @@ import { KeyedConcurrencyGate, type Release } from './concurrency.ts';
  */
 const DEFAULT_CONTEXT_WINDOW = 131_072;
 const MODELS_TIMEOUT_MS = 10_000;
-/** 提交给 provider 重试层的延迟上限（毫秒）：本地退避与 429 Retry-After 均受此约束。 */
-const PROVIDER_RETRY_AFTER_CAP_MS = 3_000;
+/**
+ * 提交给 provider 重试层的延迟上限（毫秒）：本地退避与非配额 429 的
+ * Retry-After 均受此约束，同时作为重试策略退避单次上限。
+ * fix-sensenova-429-quota-retry（2026-09-04 实测）：原 3000ms 与配额窗口量级
+ * 不符——TPM 为 60 秒窗口，提升到 60000ms（spec 允许区间 60–120s 的下沿）。
+ */
+const PROVIDER_RETRY_AFTER_CAP_MS = 60_000;
+/** 配额类 429 退避指导（providerRetryAfterMs）的绝对上限（毫秒）：spec 允许区间 60–120s 的上沿，
+ * 防止网关异常 Retry-After 把退避拖到分钟级以外（design D2）。 */
+const QUOTA_RETRY_AFTER_CEILING_MS = 120_000;
+/** 配额类 429（code 8，rps/rpm exhausted）退避下限（毫秒）。2026-09-04 实测：速率桶补充 ≈1 个/14s，15s 覆盖一个完整补充周期。 */
+export const QUOTA_RATE_RETRY_FLOOR_MS = 15_000;
+/** 配额类 429（code 429001，inference tpm exhausted）退避下限（毫秒）。2026-09-04 实测：TPM 按 60 秒窗口翻转。 */
+export const QUOTA_TPM_RETRY_FLOOR_MS = 60_000;
+/** 生成请求连接/首字节超时（毫秒）。2026-09-04 实测：传输挂起 ≈1/5 且无 RST，45s 覆盖大 prompt 建连+首包（design D4/D6）。 */
+export const CONNECT_TIMEOUT_MS = 45_000;
+/** SSE 流空闲看门狗（毫秒）：距上一事件 ≥ 该值无任何 chunk/事件即按停摆结束。2026-09-04 实测：思考期渠道有空事件/心跳自然重置计时（design D4/D6）。 */
+export const STREAM_IDLE_TIMEOUT_MS = 60_000;
 /** 已知不可路由的模型 id 清单（已下线路由，调用返回 404）。 */
 const KNOWN_UNROUTABLE_MODELS: ReadonlySet<string> = new Set(['sensenova-6.7-flash-lite']);
 /** 明确的模型不可用错误码（不在默认可重试集合内，故不触发 provider 重试）。 */
@@ -78,25 +94,43 @@ export interface SensenovaConnection {
   accountCount: number;
   /** 每 key 并发生成请求上限（正整数）；非法值在并发闸内回退 1。 */
   concurrency?: number;
+  /** 配额类 429 粘性换 key 开关（默认关；开启后仅配额类 429 触发切换，design D5）。 */
+  quotaRotation?: boolean;
   /** 手动模型可选覆盖；缺省等价于空选择（自动过滤）。 */
   modelSelection?: ModelSelection;
 }
 
 const EMPTY_MODEL_SELECTION: ModelSelection = { include: [], exclude: [] };
 
+/** 生成请求三段超时注入（毫秒，测试用）；缺省用模块级常量/并发闸默认。 */
+export interface SensenovaTimeouts {
+  /** 连接/首字节超时；缺省 CONNECT_TIMEOUT_MS。 */
+  connectMs?: number;
+  /** SSE 流空闲看门狗；缺省 STREAM_IDLE_TIMEOUT_MS。 */
+  streamIdleMs?: number;
+  /** 并发闸排队超时；缺省 concurrency.DEFAULT_QUEUE_TIMEOUT_MS。 */
+  queueMs?: number;
+}
+
 export interface SensenovaAdapterDeps {
-  /** 每请求的连接事实（apiBase、账户数、并发上限）。 */
+  /** 每请求的连接事实（apiBase、账户数、并发上限、配额轮换开关）。 */
   options: () => SensenovaConnection;
   /** 解析一个可用 key（无可解析 key 时抛 MISSING_CREDENTIAL）。 */
   resolveApiKey: (connection: SensenovaConnection) => Promise<string>;
-  /** 记录一次拒绝（仅 401 会禁用账号）并轮换到下一个 key；返回 undefined 表示无更多 key。 */
+  /**
+   * 轮换到下一个 key：401（'invalid-credential'）永久禁用被拒账号；
+   * 配额类 429（'quota-exhausted'）不写任何账号状态，仅用于换 key（design D5）。
+   * 返回 undefined 表示无更多 key。
+   */
   rotateApiKey: (
     rejectedKey: string,
-    rejection: 'invalid-credential',
+    rejection: 'invalid-credential' | 'quota-exhausted',
   ) => Promise<string | undefined>;
   fetchImpl?: typeof fetch;
   /** 每 key 并发闸；缺省为进程内实例（可注入以利测试）。 */
   concurrencyGate?: KeyedConcurrencyGate;
+  /** 三段超时注入（测试用）；缺省为生产常量。 */
+  timeouts?: SensenovaTimeouts;
 }
 
 /** 目录条目：宿主所需的能力元数据快照（listModels 后缓存，resolveModel 消费）。 */
@@ -633,15 +667,40 @@ function processChunkEvent(event: unknown, state: SseState): StreamChunk[] {
 async function* parseOpenAiSse(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal | undefined,
+  idleTimeoutMs: number,
 ): AsyncIterable<StreamChunk> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const state = createSseState();
   let buffer = '';
   let finished = false;
+  // 流空闲看门狗（design D4，2026-09-04 实测：思考期渠道有空事件/心跳自然重置）：
+  // 每次读到事件即重置计时；距上一事件 ≥ idleTimeoutMs 无任何 chunk/事件时以
+  // TimeoutError 中断挂起的 read，走 finally 释放额度并在 catch 映射可重试 TIMEOUT。
+  let watchdogReject: ((error: unknown) => void) | undefined;
+  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+  const armWatchdog = () => {
+    if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
+    watchdogTimer = setTimeout(() => {
+      watchdogReject?.(new DOMException(`SenseNova stream idle for ${idleTimeoutMs}ms`, 'TimeoutError'));
+    }, idleTimeoutMs);
+  };
+  const disarmWatchdog = () => {
+    if (watchdogTimer !== undefined) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = undefined;
+    }
+  };
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      // read 与看门狗竞争：看门狗先触发则中断挂起的 read（消费侧背压不计入空闲）。
+      const read: ReadableStreamReadResult<Uint8Array> = await new Promise((resolve, reject) => {
+        watchdogReject = reject;
+        reader.read().then(resolve, reject);
+        armWatchdog();
+      });
+      disarmWatchdog();
+      const { done, value } = read;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -682,9 +741,19 @@ async function* parseOpenAiSse(
       yield { type: 'finish', reason: { kind: 'stop' } };
     }
   } catch (error) {
+    // 连接超时 signal（与 fetch 共用）在流阶段触发时，reason 为 TimeoutError：
+    // 同样按可重试 TIMEOUT 收口（宿主 signal abort 保持原样透传）。
+    if ((signal?.aborted && isTimeoutReason(signal.reason)) || isTimeoutReason(error)) {
+      throw new LlmError(
+        `llm-sensenova: SenseNova stream stalled or timed out；SenseNova 流式响应停摆或超时（空闲/首字节超时，已释放并发额度），交宿主重试层处理`,
+        'TIMEOUT',
+        { cause: error },
+      );
+    }
     if (signal?.aborted || error instanceof LlmError) throw error;
     throw new LlmError(`llm-sensenova: SenseNova stream failed: ${errorChain(error)}；SenseNova 流式响应中途失败`, 'TRANSPORT', { cause: error });
   } finally {
+    disarmWatchdog();
     await reader.cancel().catch(() => void 0);
     reader.releaseLock();
   }
@@ -694,6 +763,41 @@ async function* parseOpenAiSse(
 function isModelNotFoundText(errText: string): boolean {
   const lower = errText.toLowerCase();
   return lower.includes('model route not found') || lower.includes('model is not found');
+}
+
+/** 是否为 AbortSignal.timeout / 看门狗 / 排队超时产生的 TimeoutError。 */
+function isTimeoutReason(value: unknown): value is Error {
+  return value instanceof Error && value.name === 'TimeoutError';
+}
+
+/** 429 分类结果：配额类附带退避下限（毫秒）；非配额类下限为 undefined。 */
+export interface RateLimit429Classification {
+  quota: boolean;
+  retryFloorMs: number | undefined;
+}
+
+/**
+ * 解析 429 响应体并按 error.code 二分类（design D1，2026-09-04 实测）：
+ * 配额类 = code 8（rps/rpm exhausted，速率桶补充 ≈1 个/14s）或 code 429001
+ * （inference tpm exhausted，TPM 60s 窗口；code 实测可能是数字或字符串，做容错）。
+ * 其余（含无 code、非 JSON 体、解析失败）归非配额类，维持现行短退避语义。
+ * 按 code 而非 message/type 分类：message 措辞随版本漂移（同 code 8 出现过
+ * `rps exhausted` 与 `rpm exhausted`），429001 的 type 实测为 invalid_request_error
+ * 而非官方错误表标注的 quota_exceeded_error，按 type 分类会漏掉 TPM 类。
+ */
+export function classify429Body(bodyText: string): RateLimit429Classification {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { quota: false, retryFloorMs: undefined };
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.error)) return { quota: false, retryFloorMs: undefined };
+  const code = parsed.error.code;
+  if (typeof code !== 'number' && typeof code !== 'string') return { quota: false, retryFloorMs: undefined };
+  if (code === 8 || code === '8') return { quota: true, retryFloorMs: QUOTA_RATE_RETRY_FLOOR_MS };
+  if (code === 429001 || code === '429001') return { quota: true, retryFloorMs: QUOTA_TPM_RETRY_FLOOR_MS };
+  return { quota: false, retryFloorMs: undefined };
 }
 
 /** 把预流 HTTP 失败映射为稳定 LlmError。 */
@@ -713,15 +817,28 @@ function httpError(status: number, errText: string, retryAfterMs: number | undef
     );
   }
   if (status === 429) {
-    // SenseNova 429 属渠道常态性 RPM 瞬时超限：不轮换 key（保护按 key 命中的 prompt 缓存）、
-    // 不冷却账号。超长 Retry-After（> 3000ms）整值不透传 providerRetryAfterMs（也不截断），
-    // 由宿主本地退避策略计算；<= 3000ms 才透传。
-    const cappedRetryAfterMs = retryAfterMs !== undefined && retryAfterMs > 0 && retryAfterMs <= PROVIDER_RETRY_AFTER_CAP_MS
-      ? retryAfterMs
-      : undefined;
+    // SenseNova 429 按 error.code 二分类（design D1/D2，2026-09-04 实测）：
+    // 配额类（code 8 速率耗尽 / 429001 TPM 耗尽）携带退避下限 providerRetryAfterMs
+    // （速率 15s≈一个桶补充周期，TPM 60s 窗口）；响应 Retry-After 大于下限时优先采用。
+    // 非配额类维持现行短退避语义：Retry-After <= 上限时透传，超长整值不透传
+    // （也不截断），由宿主本地退避策略计算。任何 429 都不轮换、不冷却账号。
+    const classified = classify429Body(errText);
+    let providerRetryAfterMs: number | undefined;
+    if (classified.retryFloorMs !== undefined) {
+      // 配额类：退避下限生效，Retry-After 更大时优先（design D2，不受非配额类透传上限约束），
+      // 整体封顶 120s（QUOTA_RETRY_AFTER_CEILING_MS），避免异常 Retry-After 突破 spec 区间上沿。
+      providerRetryAfterMs = Math.min(
+        Math.max(classified.retryFloorMs, retryAfterMs !== undefined && retryAfterMs > 0 ? retryAfterMs : 0),
+        QUOTA_RETRY_AFTER_CEILING_MS,
+      );
+    } else {
+      providerRetryAfterMs = retryAfterMs !== undefined && retryAfterMs > 0 && retryAfterMs <= PROVIDER_RETRY_AFTER_CAP_MS
+        ? retryAfterMs
+        : undefined;
+    }
     return new LlmError('llm-sensenova: SenseNova API error 429 — rate limited；SenseNova API 返回 429：请求被限流', 'RATE_LIMIT', {
       status: 429,
-      ...(cappedRetryAfterMs !== undefined ? { providerRetryAfterMs: cappedRetryAfterMs } : {}),
+      ...(providerRetryAfterMs !== undefined ? { providerRetryAfterMs } : {}),
     });
   }
   return new LlmError(`llm-sensenova: SenseNova API error ${status}: ${errText.slice(0, 500)}`, 'PROVIDER_HTTP_ERROR', { status });
@@ -735,6 +852,21 @@ export class SensenovaAdapter extends LlmAdapter {
   private catalog: CatalogEntry[] = [];
   /** 进程内失败缓存：运行时返回 MODEL_NOT_FOUND 的模型 id，直到适配器生命周期结束。 */
   private readonly failedModels = new Set<string>();
+  /**
+   * 配额类 429 粘住 key（design D5，仅 quotaRotation 开启时读写）：
+   * 有 sessionId 的请求按会话分桶（同一会话后续请求粘住切换后的 key）；
+   * 无 sessionId 的请求共享进程级桶（undefined 键）——宿主 GenerateOptions
+   * 仅提供 sessionId 这一会话标识，粘性粒度即「会话（无标识时为进程）」，
+   * 与 spec「同一会话后续请求继续使用新 key」对齐。条目仅存内存，随适配器
+   * 生命周期结束。
+   */
+  private readonly quotaStickyKeys = new Map<string | undefined, string>();
+  /**
+   * 配额轮换「已环回」标记（design D5）：某会话按序试完所有可用 key 均被配额类
+   * 429 拒绝后记录，后续请求停留在当前 key 按退避下限等待、不再轮换，避免双 key
+   * 都饱和时宿主每轮重试都乒乓切换；该会话任一请求成功（配额恢复）后清除。
+   */
+  private readonly quotaRingExhausted = new Set<string | undefined>();
 
   constructor(deps: SensenovaAdapterDeps) {
     super();
@@ -751,7 +883,10 @@ export class SensenovaAdapter extends LlmAdapter {
     return resolveRetryPolicy(
       {
         mode: 'normal',
-        maxRetries: 1000,
+        // fix-sensenova-429-quota-retry（design D3）：重试预算有限化——原 1000 次
+        // 在持续限流时呈「无限重试」观感；10 次 × 15–60s 退避（约 3–10 分钟）已
+        // 覆盖可预期的配额恢复窗口，超出应显式失败。
+        maxRetries: 10,
         backoff: { maxDelayMs: PROVIDER_RETRY_AFTER_CAP_MS },
       },
       'llm-sensenova.retryPolicy',
@@ -812,18 +947,59 @@ export class SensenovaAdapter extends LlmAdapter {
     const body = JSON.stringify(buildOpenAiBody(options));
     const tried = new Set<string>();
     const limit = connection.concurrency;
-    let apiKey = await this.deps.resolveApiKey(connection);
+    // 三段超时（design D4/D6，2026-09-04 实测）：生产用常量，测试可注入小值。
+    const connectMs = this.deps.timeouts?.connectMs ?? CONNECT_TIMEOUT_MS;
+    const streamIdleMs = this.deps.timeouts?.streamIdleMs ?? STREAM_IDLE_TIMEOUT_MS;
+    const queueMs = this.deps.timeouts?.queueMs;
+    const quotaRotation = connection.quotaRotation === true;
+    // 粘性起点（design D5）：开关开启时优先从「该会话粘住的 key」起步（指针初始
+    // undefined 时等价 resolveApiKey 默认结果）；粘住的 key 若已失效（如被删除/禁用）
+    // 会走既有 401 轮换路径自然恢复。开关关闭时不读写指针，行为与现状完全一致。
+    const stickyKey = quotaRotation ? this.quotaStickyKeys.get(options.sessionId) : undefined;
+    let apiKey = stickyKey ?? await this.deps.resolveApiKey(connection);
     let response: Response | undefined;
     // 当前 attempt 持有的并发额度；成功进入流式阶段后保持到 finally 释放。
     let release: Release | undefined;
+    // 各 attempt 的连接超时清理（清计时器 + 摘除宿主 abort 转发 listener），finally 统一执行。
+    const connectCleanups: Array<() => void> = [];
 
     try {
       for (let rotations = 0; ; ) {
         tried.add(apiKey);
-        // 按本次 attempt 实际使用的 key 获取并发额度；排队期间中止会在此 reject（不占额度）。
-        release = await this.gate.acquire(apiKey, limit, options.signal);
+        // 按本次 attempt 实际使用的 key 获取并发额度；排队期间中止会在此 reject
+        // （不占额度），排队超时以 TimeoutError reject（同样不占额度），统一映射
+        // 可重试 TIMEOUT 交宿主重试层（design D4）。await 抛出时 release 保持
+        // undefined，finally 不误放他人额度。
+        try {
+          release = await this.gate.acquire(apiKey, limit, options.signal, queueMs);
+        } catch (error) {
+          if (!isTimeoutReason(error)) throw error;
+          throw new LlmError(
+            `llm-sensenova: request queued behind the per-key concurrency limit for over ${queueMs ?? DEFAULT_QUEUE_TIMEOUT_MS}ms；SenseNova 请求排队超时（未占用并发额度），交宿主重试层退避后重试`,
+            'TIMEOUT',
+            { cause: error },
+          );
+        }
         let attempt: Response;
         try {
+          // 连接/首字节超时（design D4，2026-09-04 实测传输挂起 ≈1/5 且无 RST）：
+          // 自管 AbortController + setTimeout，响应头到达即清除计时器——超时只约束
+          // 建连/首包阶段（不可用 AbortSignal.timeout：undici 下它会在整个 body
+          // 读取阶段持续生效，超过 connectMs 的健康长流会被误杀）。控制器全程转发
+          // 宿主 abort，body 阶段的中止语义与直传宿主 signal 等价。
+          const connectController = new AbortController();
+          const connectTimer = setTimeout(() => {
+            connectController.abort(new DOMException('connect timed out', 'TimeoutError'));
+          }, connectMs);
+          const onHostAbort = () => connectController.abort(options.signal?.reason);
+          if (options.signal !== undefined) {
+            if (options.signal.aborted) connectController.abort(options.signal.reason);
+            else options.signal.addEventListener('abort', onHostAbort, { once: true });
+          }
+          connectCleanups.push(() => {
+            clearTimeout(connectTimer);
+            options.signal?.removeEventListener('abort', onHostAbort);
+          });
           attempt = await this.fetchImpl(`${connection.apiBase}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -832,16 +1008,27 @@ export class SensenovaAdapter extends LlmAdapter {
               ...attributionHeaders(),
             },
             body,
-            ...(options.signal !== undefined ? { signal: options.signal } : {}),
+            signal: connectController.signal,
           });
+          // 响应头已到达：连接超时使命完成（finally 里的 clearTimeout 为幂等兜底）。
+          clearTimeout(connectTimer);
         } catch (error) {
           release();
           release = undefined;
           if (options.signal?.aborted) throw error;
+          if (isTimeoutReason(error)) {
+            throw new LlmError(
+              `llm-sensenova: request to ${connection.apiBase} timed out after ${connectMs}ms；SenseNova 请求建连或首包超时（已释放并发额度），交宿主重试层处理`,
+              'TIMEOUT',
+              { cause: error },
+            );
+          }
           throw new LlmError(`llm-sensenova: request to ${connection.apiBase} failed: ${errorChain(error)}；连接 SenseNova API 失败，通常是网络或代理问题`, 'TRANSPORT', { cause: error });
         }
         if (attempt.ok) {
           response = attempt;
+          // 配额已恢复：清除该会话的环回标记，未来配额类 429 可再次轮换。
+          if (quotaRotation) this.quotaRingExhausted.delete(options.sessionId);
           break; // 额度随 response 保留，由外层 finally 在流结束后释放
         }
         const errText = await attempt.text().catch(() => '');
@@ -854,25 +1041,39 @@ export class SensenovaAdapter extends LlmAdapter {
           this.failedModels.add(options.model);
           throw httpError(attempt.status, errText, retryAfterMs);
         }
-        // 429：SenseNova 渠道常态性 RPM 瞬时超限，不代表账号被封。不轮换 key
-        // （一个会话固定使用一个 key，轮换会破坏服务端按 key 命中的 prompt 缓存）、
-        // 也不做账号冷却，直接抛 RATE_LIMIT 交给宿主重试层自动退避后原 key 重试。
-        // 并发闸已在源头抑制并发超限，此处为兜底。
-        const rotatable = attempt.status === 401;
+        // 429：SenseNova 渠道常态性限流，不代表账号异常。不冷却账号；默认不轮换 key
+        // （一个会话固定使用一个 key，保护服务端按 key 命中的 prompt 缓存），直接抛
+        // RATE_LIMIT 交宿主重试层自动退避后原 key 重试。quotaRotation 开启时，仅
+        // 配额类 429（error.code 8 / 429001）粘性切换到下一把未试过的 key 重试本次
+        // 请求（design D5）；环回无新 key 则停留在当前 key 抛 RATE_LIMIT。401 轮换
+        // 路径不变。并发闸已在源头抑制并发超限，此处为兜底。
+        const classified = classify429Body(errText);
+        const quota429 = attempt.status === 429 && classified.quota;
+        // 已环回的会话不再轮换（design D5）：停留在当前 key 抛 RATE_LIMIT 交宿主按
+        // 退避下限等待，避免双 key 都饱和时宿主每轮重试都乒乓切换。
+        const quotaRotate = quota429 && quotaRotation && !this.quotaRingExhausted.has(options.sessionId);
+        const rotatable = attempt.status === 401 || quotaRotate;
         if (rotatable && options.signal?.aborted !== true && rotations < connection.accountCount) {
-          rotations += 1;
+          // 'quota-exhausted' 不写任何账号状态；401 仍走禁用轮换。
           const next = await this.deps.rotateApiKey(
             apiKey,
-            'invalid-credential',
+            attempt.status === 401 ? 'invalid-credential' : 'quota-exhausted',
           );
           if (next !== undefined && !tried.has(next)) {
-            // 401 预流轮换：先释放旧 key 额度，下一轮为新 key 重新获取。
+            // 预流轮换：先释放旧 key 额度，下一轮为新 key 重新获取。
             release();
             release = undefined;
             apiKey = next;
+            rotations += 1;
+            if (quotaRotate) {
+              this.quotaStickyKeys.set(options.sessionId, next); // 粘住新 key
+              this.quotaRingExhausted.delete(options.sessionId); // 新 key 配额新鲜
+            }
             continue;
           }
         }
+        // 配额类 429 无可切换的新 key（环回）：记录环回状态后停留在当前 key 抛错。
+        if (quota429 && quotaRotation) this.quotaRingExhausted.add(options.sessionId);
         release();
         release = undefined;
         throw httpError(attempt.status, errText, retryAfterMs);
@@ -885,8 +1086,9 @@ export class SensenovaAdapter extends LlmAdapter {
       if (response.body === null) {
         throw new LlmError('llm-sensenova: SenseNova API returned no response body', 'PROVIDER_PROTOCOL_ERROR');
       }
-      yield* parseOpenAiSse(response.body, options.signal);
+      yield* parseOpenAiSse(response.body, options.signal, streamIdleMs);
     } finally {
+      for (const cleanup of connectCleanups) cleanup();
       release?.();
     }
   }

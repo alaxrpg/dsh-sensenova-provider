@@ -159,6 +159,9 @@ function injectPageCss(): void {
     '.sn-advancedBody{display:flex;flex-direction:column;gap:10px;padding:0 14px 14px;border-top:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.22));min-width:0}',
     '.sn-advancedBody[hidden]{display:none}',
     '.sn-models{display:flex;flex-direction:column;gap:10px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:8px;padding:10px;background:var(--dsw-alias-bg-layer-1,transparent);min-width:0}',
+    /* 配额类 429 换 key 开关 */
+    '.sn-toggle{width:16px;height:16px;margin:0;flex:0 0 auto;accent-color:var(--dsw-alias-brand-primary,#3b82f6);cursor:pointer}',
+    '.sn-toggle:disabled{opacity:.5;cursor:not-allowed}',
     '.sn-providerCard{display:flex;flex-direction:column;gap:10px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:10px;padding:12px;background:var(--dsw-alias-bg-layer-1,transparent);min-width:0}',
     /* 账户总览条 */
     '.sn-accountSummary{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.07));border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.22))}',
@@ -199,6 +202,7 @@ function applyClientSurfaces(ctx: ClientContextLike, credentials: CredentialsFac
     editDefaultKey: (text: string) => controller.editDefaultKey(text),
     toggleDefaultKeyClear: () => controller.toggleDefaultKeyClear(),
     setActiveAccount: (id: string) => controller.setActiveAccount(id),
+    setQuotaRotation: (on: boolean) => controller.setQuotaRotation(on),
   });
 
   ctx.slots.inject('settings.section', () => ctx.slots.register({

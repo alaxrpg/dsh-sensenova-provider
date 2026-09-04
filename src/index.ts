@@ -51,6 +51,8 @@ export interface SensenovaConfig {
   modelSelection?: { include?: string[]; exclude?: string[] };
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
   concurrency?: number;
+  /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
+  quotaRotation?: boolean;
 }
 
 export const Config: z<SensenovaConfig> = z.object({
@@ -67,6 +69,8 @@ export const Config: z<SensenovaConfig> = z.object({
     exclude: z.array(z.string()).default([]),
   }),
   concurrency: z.natural().min(1).default(1),
+  // 高级设置：「配额类 429 换 key」，默认关（design D5：尊重既有「429 不换 key」决策）。
+  quotaRotation: z.boolean().default(false),
 });
 
 /** 一个解析后的账户槽位：id/label + 合法 credential-ref 名。 */
@@ -85,6 +89,8 @@ export interface ResolvedSensenovaOptions {
   activeAccount: string;
   accounts: ResolvedAccountSpec[];
   concurrency: number;
+  /** 配额类 429 粘性换 key（默认 false）。 */
+  quotaRotation: boolean;
   modelSelection?: ModelSelection;
 }
 
@@ -150,6 +156,8 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     activeAccount: typeof config.activeAccount === 'string' ? config.activeAccount : '',
     accounts,
     concurrency: normalizeConcurrency(config.concurrency),
+    // 防御非布尔输入（程序化构造可能绕过 Schemastery 归一化）。
+    quotaRotation: config.quotaRotation === true,
     ...(modelSelection !== undefined ? { modelSelection } : {}),
   };
 }
@@ -209,8 +217,10 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
 
   const rotateApiKey = async (
     rejectedKey: string,
-    rejection: 'invalid-credential',
+    rejection: 'invalid-credential' | 'quota-exhausted',
   ): Promise<string | undefined> => {
+    // 'invalid-credential'（401）永久禁用被拒账号；'quota-exhausted'（配额类 429）
+    // 不写任何账号状态，仅用于选取下一把可用 key（design D5）。
     pool.markRejected(rejectedKey, rejection);
     const resolved = await pool.resolveKey({ exclude: rejectedKey });
     if (resolved === undefined) return undefined;
@@ -224,6 +234,7 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
         apiBase: resolved.apiBase,
         accountCount: resolved.accounts.length,
         concurrency: resolved.concurrency,
+        quotaRotation: resolved.quotaRotation,
         ...(resolved.modelSelection !== undefined ? { modelSelection: resolved.modelSelection } : {}),
       };
     },

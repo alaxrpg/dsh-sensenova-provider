@@ -17,11 +17,18 @@
  */
 import { LlmError } from '@deepseek-ai/dsh-llm';
 
-/** provider 层允许透传的 Retry-After 上限（毫秒）。 */
-export const PROVIDER_RETRY_AFTER_CAP_MS = 3_000;
+/**
+ * provider 层允许透传的 Retry-After 上限（毫秒）。
+ * fix-sensenova-429-quota-retry（2026-09-04 实测）：TPM 为 60 秒窗口，上限提升到
+ * 60000ms（原 3000ms 与配额窗口量级不符）；与 adapter.ts 的本地副本保持一致。
+ */
+export const PROVIDER_RETRY_AFTER_CAP_MS = 60_000;
 
-/** 拒绝类型：401 → 永久禁用；429 不产生任何状态（见 markRejected）。 */
-export type Rejection = 'rate-limit' | 'invalid-credential';
+/**
+ * 拒绝类型：invalid-credential（401）→ 永久禁用；
+ * rate-limit 与 quota-exhausted（429）→ 不写任何状态（见 markRejected）。
+ */
+export type Rejection = 'rate-limit' | 'invalid-credential' | 'quota-exhausted';
 
 /** 单个 key 的轮换状态。目前仅 disabled（401 永久禁用），until 恒为 0。 */
 export type RotationState = { kind: 'disabled'; until: 0 };
@@ -78,10 +85,10 @@ export function parseRetryAfterMs(value: string | null | undefined, now: number 
 
 /**
  * 记录一次拒绝。`invalid-credential`（401）永久禁用。
- * `rate-limit`（429）不写任何状态：SenseNova 渠道常态性 RPM 瞬时超限不代表账号异常，
- * 一个会话固定使用一个 key（轮换会破坏服务端按 key 命中的 prompt 缓存），
- * 429 由宿主重试层自动退避后用原 key 重试，账号永远可用。
- * 状态写入 `states`（以 key 为键），便于测试直接驱动。
+ * `rate-limit` 与 `quota-exhausted`（429，含 quotaRotation 开启时的配额类粘性换 key）
+ * 不写任何状态：SenseNova 渠道常态性限流不代表账号异常，任何 429 都不冷却、
+ * 不禁用账号（design D1/D5，2026-09-04 实测）；配额类粘性换 key 只选取下一把
+ * 可用 key，被拒 key 保持可用。状态写入 `states`（以 key 为键），便于测试直接驱动。
  */
 export function markRejected(
   states: Map<string, RotationState>,

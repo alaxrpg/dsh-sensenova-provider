@@ -31,6 +31,8 @@ interface SensenovaConfig {
   };
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
   concurrency?: number;
+  /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
+  quotaRotation?: boolean;
 }
 declare const Config: z<SensenovaConfig>;
 /** 一个解析后的账户槽位：id/label + 合法 credential-ref 名。 */
@@ -48,6 +50,8 @@ interface ResolvedSensenovaOptions {
   activeAccount: string;
   accounts: ResolvedAccountSpec[];
   concurrency: number;
+  /** 配额类 429 粘性换 key（默认 false）。 */
+  quotaRotation: boolean;
   modelSelection?: ModelSelection;
 }
 /** 把配置的并发上限归一化为正整数（非正整数/无法解析回退 1）。 */

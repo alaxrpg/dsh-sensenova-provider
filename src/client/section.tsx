@@ -19,6 +19,11 @@ interface ChangeEventLike {
   target: { value: string };
 }
 
+/** 复选框 change 事件的最小结构。 */
+interface ToggleEventLike {
+  target: { checked: boolean };
+}
+
 export interface SenseNovaSectionProps {
   t: TranslateFn;
   /** slots 框架注入的 uSES hook（由 injected.hooks.sensenovaSettings 派生）。 */
@@ -34,6 +39,7 @@ export interface SenseNovaSectionProps {
   editDefaultKey: (text: string) => void;
   toggleDefaultKeyClear: () => void;
   setActiveAccount: (id: string) => void;
+  setQuotaRotation: (on: boolean) => void;
 }
 
 function useSavedFlash(savedCount: number): boolean {
@@ -103,13 +109,13 @@ function AdvancedSettings(props: {
   state: SettingsState;
   disabled: boolean;
   edit: (field: FieldName, text: string) => void;
+  setQuotaRotation: (on: boolean) => void;
 }): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const customizedCount =
     (props.state.apiBase !== DEFAULT_API_BASE ? 1 : 0) +
     (props.state.concurrency !== 1 ? 1 : 0) +
-    (props.state.modelSelectionInclude.length > 0 ? 1 : 0) +
-    (props.state.modelSelectionExclude.length > 0 ? 1 : 0);
+    (props.state.quotaRotation !== false ? 1 : 0);
 
   return (
     <div className="sn-card sn-advanced">
@@ -172,36 +178,22 @@ function AdvancedSettings(props: {
             />
             <p className="sn-hint">{props.t('concurrencyHint')}</p>
           </div>
-          <div className="sn-field">
-            <label className="sn-label" htmlFor="sn-model-selection-include">
-              {props.t('modelInclude')}
-            </label>
-            <textarea
-              id="sn-model-selection-include"
-              className="sn-input sn-textarea"
-              rows={4}
-              value={props.state.modelSelectionIncludeDraft}
+          <p className="sn-hint sn-modelsNote">{props.t('modelsAutoManaged')}</p>
+        </div>
+
+        <div className="sn-field">
+          <label className="sn-fieldHead" htmlFor="sn-quota-rotation">
+            <span className="sn-label">{props.t('quotaRotation')}</span>
+            <input
+              id="sn-quota-rotation"
+              className="sn-toggle"
+              type="checkbox"
+              checked={props.state.quotaRotationDraft}
               disabled={props.disabled}
-              spellCheck={false}
-              onChange={(event: ChangeEventLike) => props.edit('modelSelectionInclude', event.target.value)}
+              onChange={(event: ToggleEventLike) => props.setQuotaRotation(event.target.checked)}
             />
-            <p className="sn-hint">{props.t('modelIncludeHint')}</p>
-          </div>
-          <div className="sn-field">
-            <label className="sn-label" htmlFor="sn-model-selection-exclude">
-              {props.t('modelExclude')}
-            </label>
-            <textarea
-              id="sn-model-selection-exclude"
-              className="sn-input sn-textarea"
-              rows={4}
-              value={props.state.modelSelectionExcludeDraft}
-              disabled={props.disabled}
-              spellCheck={false}
-              onChange={(event: ChangeEventLike) => props.edit('modelSelectionExclude', event.target.value)}
-            />
-            <p className="sn-hint">{props.t('modelExcludeHint')}</p>
-          </div>
+          </label>
+          <p className="sn-hint">{props.t('quotaRotationHint')}</p>
         </div>
       </div>
     </div>
@@ -275,7 +267,8 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
               {t('accountAdd')}
             </button>
           </div>
-          <p className="sn-hint">{t('accountsHint')}</p>
+          {/* 轮换说明与「配额类 429 换 key」开关状态保持一致（默认仍表述 429 不切换）。 */}
+          <p className="sn-hint">{state.quotaRotationDraft ? t('accountsHintQuotaRotation') : t('accountsHint')}</p>
         </div>
 
         {/* 账户总览条：一目了然显示总数、已配置数、当前生效账户 */}
@@ -355,7 +348,7 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
 
       {/* 分组 3：高级选项 */}
       <SectionHeading text={t('groupAdvanced')} />
-      <AdvancedSettings t={t} state={state} disabled={disabled} edit={props.edit} />
+      <AdvancedSettings t={t} state={state} disabled={disabled} edit={props.edit} setQuotaRotation={props.setQuotaRotation} />
 
       {/* 保存 / 重置 */}
       <div className="sn-footer">

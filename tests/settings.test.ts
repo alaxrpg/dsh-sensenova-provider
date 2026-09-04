@@ -2,24 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SenseNovaSettingsController,
-  parseModelIds,
   type CredentialsFace,
   type SettingsScope,
   type SenseNovaConfig,
   type ScopeSnapshot,
 } from '../src/client/settings.ts';
 
-test('parseModelIds: 支持换行/逗号、trim、稳定去重', () => {
-  assert.deepEqual(parseModelIds(' a, b\na\n ,c '), ['a', 'b', 'c']);
-});
-
-test('SenseNovaSettingsController: 模型选择保存、dirty、discard 与清空 unset', async () => {
-  let value: SenseNovaConfig = { modelSelection: { include: ['old'], exclude: ['hidden'] } };
+test('SenseNovaSettingsController: quotaRotation 缺省关、staged 保存热生效与 discard', async () => {
+  let value: SenseNovaConfig = {};
   const listeners = new Set<() => void>();
   const scope: SettingsScope<SenseNovaConfig> = {
-    getSnapshot(): ScopeSnapshot<SenseNovaConfig> {
-      return { status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' };
-    },
+    getSnapshot: () => ({ status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' }),
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async set(field, next) {
       value = { ...value, [field]: next } as SenseNovaConfig;
@@ -38,17 +31,37 @@ test('SenseNovaSettingsController: 模型选择保存、dirty、discard 与清�
     unset: async () => ({ ok: true }),
   };
   const controller = new SenseNovaSettingsController(scope, credentials);
-  controller.edit('modelSelectionInclude', ' new, old\nnew ');
-  controller.edit('modelSelectionExclude', 'hidden, blocked');
-  assert.equal(controller.state().dirty, true);
-  await controller.save();
-  assert.deepEqual(value.modelSelection, { include: ['new', 'old'], exclude: ['hidden', 'blocked'] });
+  assert.equal(controller.state().quotaRotation, false, '缺省关闭');
+  assert.equal(controller.state().quotaRotationDraft, false);
   assert.equal(controller.state().dirty, false);
 
-  controller.edit('modelSelectionInclude', '');
-  controller.edit('modelSelectionExclude', '');
+  // staged 开启：展示值立即变化，生效值在保存前不变。
+  controller.setQuotaRotation(true);
+  assert.equal(controller.state().dirty, true);
+  assert.equal(controller.state().quotaRotationDraft, true, 'staged 立即反映到展示值');
+  assert.equal(controller.state().quotaRotation, false, '保存前生效值不变');
+
   await controller.save();
-  assert.equal(value.modelSelection, undefined);
+  assert.equal(value.quotaRotation, true, '经 settings 命名空间持久化');
+  assert.equal(controller.state().quotaRotation, true, '保存即热生效');
+  assert.equal(controller.state().dirty, false);
+
+  // 可再次关闭（保存 false，而非 unset——默认即 false）。
+  controller.setQuotaRotation(false);
+  await controller.save();
+  assert.equal(value.quotaRotation, false, '再次关闭并持久化');
+
+  // discard 丢弃 staged 编辑，不影响已保存值。
+  controller.setQuotaRotation(true);
+  controller.discard();
+  assert.equal(controller.state().quotaRotationDraft, false, '丢弃 staged');
+  assert.equal(controller.state().dirty, false);
+  assert.equal(value.quotaRotation, false);
+
+  // 存储值为非法类型时归一化为默认关闭。
+  value = { quotaRotation: 'yes' as unknown as boolean };
+  for (const listener of listeners) listener();
+  assert.equal(controller.state().quotaRotation, false, '非布尔存储值回退默认关');
   controller.dispose();
 });
 

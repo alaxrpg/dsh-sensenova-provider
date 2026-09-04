@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { LlmError } from '@deepseek-ai/dsh-llm';
 import {
+  PROVIDER_RETRY_AFTER_CAP_MS,
   SensenovaAccountPool,
   accountUsable,
   markRejected,
@@ -52,6 +53,18 @@ test('markRejected: 429 不写任何状态（账号不做限流冷却）', () =>
   markRejected(map, 'k', 'rate-limit', 30_000);
   assert.equal(map.has('k'), false, 'rate-limit 不产生冷却/禁用状态');
   assert.equal(accountUsable(map.get('k')), true);
+});
+
+test('markRejected: quota-exhausted（配额类 429 粘性换 key）不写任何状态', () => {
+  const map = new Map<string, RotationState>();
+  markRejected(map, 'k', 'quota-exhausted');
+  assert.equal(map.has('k'), false, 'quota-exhausted 只用于换 key，不产生冷却/禁用状态（design D5）');
+  assert.equal(accountUsable(map.get('k')), true, '被配额拒绝的 key 保持可用');
+});
+
+test('PROVIDER_RETRY_AFTER_CAP_MS 与配额窗口量级对齐（60000ms）', () => {
+  // fix-sensenova-429-quota-retry（2026-09-04 实测）：TPM 为 60 秒窗口，上限从 3000ms 提升。
+  assert.equal(PROVIDER_RETRY_AFTER_CAP_MS, 60_000);
 });
 
 test('markRejected: 401 永久禁用', () => {

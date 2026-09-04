@@ -20,6 +20,8 @@ export const zh: Record<string, string> = {
   accountsTitle: '多账户轮换',
   accountsHint:
     '仅在密钥失效（401）时自动切换到下一个可用账户；429 限流不切换账户，由宿主重试层退避后使用原 key 重试。',
+  accountsHintQuotaRotation:
+    '密钥失效（401）时自动切换账户；已开启「配额类 429 换 key」，配额类 429 限流时也会切换到下一把 key 并粘住；任何 429 都不会冷却或禁用账户，由宿主退避后重试。',
   accountAdd: '添加账户',
   accountRemove: '删除',
   accountLabel: '账户备注名',
@@ -39,6 +41,8 @@ export const zh: Record<string, string> = {
   advancedCustomizedCount: '已自定义 {count} 项',
   concurrency: '并发上限',
   concurrencyHint: '同一 API key 同时进行的生成请求数（默认 1）。超出上限的请求排队等待，避免触发渠道并发限流。',
+  quotaRotation: '配额类 429 换 key',
+  quotaRotationHint: '仅限流耗尽时切换到下一把 key 并粘住；密钥失效（401）行为不变。',
   added: '未保存',
   readOnly: '当前配置为只读。',
   show: '显示',
@@ -85,6 +89,8 @@ export const en: Record<string, string> = {
   accountsTitle: 'Account rotation',
   accountsHint:
     'Requests switch to the next usable account only when a key fails (401); 429 rate limits do not switch accounts, and the host retry layer backs off before retrying with the original key.',
+  accountsHintQuotaRotation:
+    'Requests switch accounts when a key fails (401); with “Rotate key on quota 429” enabled, quota-type 429 rate limits also switch to the next key and stick with it. Accounts are never disabled by 429s; the host retry layer backs off before retrying.',
   accountAdd: 'Add account',
   accountRemove: 'Remove',
   accountLabel: 'Account label',
@@ -104,6 +110,8 @@ export const en: Record<string, string> = {
   advancedCustomizedCount: '{count} customized',
   concurrency: 'Concurrency limit',
   concurrencyHint: 'Maximum concurrent generation requests per API key (default 1). Requests beyond the limit queue instead of failing, avoiding channel rate limits.',
+  quotaRotation: 'Rotate key on quota 429',
+  quotaRotationHint: 'Switch to the next key only when rate limits are exhausted, then stick with it; key invalidation (401) behavior is unchanged.',
   added: 'Unsaved',
   readOnly: 'Settings are read-only.',
   show: 'Show',

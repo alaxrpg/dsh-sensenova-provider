@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { LlmError } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { SensenovaAdapter, type SensenovaConnection } from '../src/adapter.ts';
+import { KeyedConcurrencyGate } from '../src/concurrency.ts';
 import { resolveAdapterOptions } from '../src/index.ts';
 
 const CONNECTION: SensenovaConnection = { apiBase: 'https://example.invalid', accountCount: 2 };
@@ -204,8 +205,9 @@ test('stream: 429 不轮换 key，直接抛 RATE_LIMIT 交宿主退避重试', a
     assert.ok(err instanceof LlmError);
     const e = err as LlmError;
     assert.equal(e.code, 'RATE_LIMIT');
-    // 30s 超过 3000ms 上限，不透传 providerRetryAfterMs，交宿主本地退避。
-    assert.equal(e.failure.providerRetryAfterMs, undefined);
+    // 非配额类（非 JSON 体）：30s 在 60000ms 透传上限内，原样透传 providerRetryAfterMs
+    // （fix-sensenova-429-quota-retry：上限从 3000ms 提升到 60000ms，对齐 TPM 窗口量级）。
+    assert.equal(e.failure.providerRetryAfterMs, 30_000);
     return true;
   });
   assert.equal(calls, 1, '只请求一次，不换 key 重试（保护 prompt 缓存）');
@@ -443,7 +445,7 @@ test('listModels: 显示名标准化（flash-lite 显式映射 + 回退规则）
   assert.equal(byId.get('sensenova-6.8-flash-lite'), 'Sensenova 6.8 Flash Lite');
 });
 
-test('providerRetryPolicy: normal / maxRetries=1000 / maxDelayMs=3000', () => {
+test('providerRetryPolicy: normal / maxRetries=10 / maxDelayMs=60000', () => {
   const adapter = new SensenovaAdapter({
     options: () => CONNECTION,
     resolveApiKey: async () => 'key-1',
@@ -453,11 +455,13 @@ test('providerRetryPolicy: normal / maxRetries=1000 / maxDelayMs=3000', () => {
   assert.ok(policy);
   assert.equal(policy.mode, 'normal');
   if (policy.mode === 'normal') {
-    assert.equal(policy.maxRetries, 1000);
-    assert.equal(policy.maxDelayMs, 3000);
+    // fix-sensenova-429-quota-retry：重试预算有限化（1000→10），退避单次上限对齐
+    // TPM 60s 窗口（3000→60000）。
+    assert.equal(policy.maxRetries, 10);
+    assert.equal(policy.maxDelayMs, 60_000);
     assert.equal(policy.initialDelayMs, 500);
     // 保留默认 jitterRatio；宿主 localDelay 用 Math.min(..., maxDelayMs) 封顶，
-    // 故初始延迟（含最大 jitter 1.1 倍）仍在 3000ms 上限内。
+    // 故初始延迟（含最大 jitter 1.1 倍）仍在 60000ms 上限内。
     assert.ok(policy.jitterRatio >= 0 && policy.jitterRatio <= 1);
     assert.ok(policy.initialDelayMs <= policy.maxDelayMs);
     assert.ok(policy.initialDelayMs * (1 + policy.jitterRatio) <= policy.maxDelayMs);
@@ -535,7 +539,7 @@ test('stream: 运行时 404 失败模型写入失败缓存，后续 listModels �
   assert.ok(after.some((m) => m.id === 'sensenova-ok'));
 });
 
-test('stream: 429 Retry-After 超过 3000ms 不透传 providerRetryAfterMs，且不轮换不冷却', async () => {
+test('stream: 429 Retry-After 超过 60000ms 上限不透传 providerRetryAfterMs，且不轮换不冷却', async () => {
   const { adapter, calls, rotateCalls } = chatAdapter(() =>
     new Response('rate limited', { status: 429, headers: { 'retry-after': '900' } }),
   );
@@ -544,7 +548,7 @@ test('stream: 429 Retry-After 超过 3000ms 不透传 providerRetryAfterMs，且
     assert.ok(err instanceof LlmError);
     const e = err as LlmError;
     assert.equal(e.code, 'RATE_LIMIT');
-    // 超长 Retry-After 整值不透传（不截断为 3000）。
+    // 超长 Retry-After 整值不透传（不截断为上限值），由宿主本地退避计算。
     assert.equal(e.failure.providerRetryAfterMs, undefined);
     return true;
   });
@@ -553,7 +557,7 @@ test('stream: 429 Retry-After 超过 3000ms 不透传 providerRetryAfterMs，且
   assert.equal(rotateCalls.length, 0);
 });
 
-test('stream: 429 Retry-After 在 3000ms 内透传 providerRetryAfterMs', async () => {
+test('stream: 429 Retry-After 在 60000ms 上限内透传 providerRetryAfterMs', async () => {
   const { adapter } = chatAdapter(() =>
     new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } }),
   );
@@ -804,4 +808,397 @@ test('stream: 无键并行工具分片经 BlockAssembler 组装为独立完整 t
   assert.equal(skill.arguments, '{"name":"a"}', 'skill arguments 完整');
   assert.ok(bash && bash.type === 'tool-call');
   assert.equal(bash.arguments, '{"command":"ls"}', 'bash arguments 完整');
+});
+
+// ---- fix-sensenova-429-quota-retry 新增用例 ----
+
+import { classify429Body } from '../src/adapter.ts';
+
+test('classify429Body: 配额类 code 8 与 429001（数字/字符串容错），其余归非配额类', () => {
+  // code 8 数字（2026-09-04 实测现场；message 措辞随版本漂移，不参与分类）
+  assert.deepEqual(
+    classify429Body('{"error":{"message":"rpm exhausted","type":"quota_exceeded_error","code":8}}'),
+    { quota: true, retryFloorMs: 15_000 },
+  );
+  // spec 场景样本：code 为字符串 "8"
+  assert.deepEqual(
+    classify429Body('{"error":{"message":"rpm exhausted","type":"quota_exceeded_error","code":"8"}}'),
+    { quota: true, retryFloorMs: 15_000 },
+  );
+  // 429001 现场样本（type 实测为 invalid_request_error，字符串 code）
+  assert.deepEqual(
+    classify429Body('{"error":{"message":"inference tpm exhausted","type":"invalid_request_error","code":"429001"}}'),
+    { quota: true, retryFloorMs: 60_000 },
+  );
+  assert.deepEqual(
+    classify429Body('{"error":{"message":"inference tpm exhausted","code":429001}}'),
+    { quota: true, retryFloorMs: 60_000 },
+  );
+  // 无 code / 其他 code / 非 JSON 体 → 非配额类
+  assert.deepEqual(classify429Body('{"error":{"message":"throttled"}}'), { quota: false, retryFloorMs: undefined });
+  assert.deepEqual(classify429Body('{"error":{"message":"bad request","code":"400"}}'), { quota: false, retryFloorMs: undefined });
+  assert.deepEqual(classify429Body('rate limited'), { quota: false, retryFloorMs: undefined });
+  assert.deepEqual(classify429Body(''), { quota: false, retryFloorMs: undefined });
+});
+
+test('stream: 配额类 429（code 8）→ RATE_LIMIT 携带 15000ms 退避下限且不轮换', async () => {
+  const { adapter, calls, rotateCalls } = chatAdapter(() =>
+    new Response(
+      JSON.stringify({ error: { message: 'rpm exhausted', type: 'quota_exceeded_error', code: 8 } }),
+      { status: 429 },
+    ),
+  );
+
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    const e = err as LlmError;
+    assert.equal(e.code, 'RATE_LIMIT');
+    // 2026-09-04 实测：速率桶补充 ≈1 个/14s，15s 覆盖一个完整补充周期。
+    assert.equal(e.failure.providerRetryAfterMs, 15_000);
+    return true;
+  });
+  assert.equal(calls(), 1);
+  assert.equal(rotateCalls.length, 0, '默认（开关关）不轮换');
+});
+
+test('stream: 配额类 429（429001）→ 60000ms 下限；Retry-After 更大时优先、更小时不低于下限', async () => {
+  // TPM 类：2026-09-04 实测 TPM 按 60 秒窗口翻转。
+  const tpm = chatAdapter(() =>
+    new Response(
+      JSON.stringify({ error: { message: 'inference tpm exhausted', type: 'invalid_request_error', code: '429001' } }),
+      { status: 429 },
+    ),
+  );
+  await assert.rejects(collect(tpm.adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).failure.providerRetryAfterMs, 60_000);
+    return true;
+  });
+
+  // Retry-After（90s）大于下限时采用 Retry-After。
+  const larger = chatAdapter(() =>
+    new Response(JSON.stringify({ error: { message: 'rpm exhausted', code: 8 } }), {
+      status: 429,
+      headers: { 'retry-after': '90' },
+    }),
+  );
+  await assert.rejects(collect(larger.adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).failure.providerRetryAfterMs, 90_000, 'Retry-After 更大时优先');
+    return true;
+  });
+
+  // Retry-After（5s）小于下限时取下限。
+  const smaller = chatAdapter(() =>
+    new Response(JSON.stringify({ error: { message: 'inference tpm exhausted', code: 429001 } }), {
+      status: 429,
+      headers: { 'retry-after': '5' },
+    }),
+  );
+  await assert.rejects(collect(smaller.adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).failure.providerRetryAfterMs, 60_000, '不低于配额窗口下限');
+    return true;
+  });
+
+  // 配额类超长 Retry-After（900s）整体封顶 120s，不突破 spec 区间上沿。
+  const huge = chatAdapter(() =>
+    new Response(JSON.stringify({ error: { message: 'rpm exhausted', code: 8 } }), {
+      status: 429,
+      headers: { 'retry-after': '900' },
+    }),
+  );
+  await assert.rejects(collect(huge.adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).failure.providerRetryAfterMs, 120_000, '配额类 Retry-After 封顶 120s');
+    return true;
+  });
+});
+
+/** 构造一个收到 abort 信号才 settle 的挂起 fetch（模拟传输挂起，无响应字节）。 */
+function hangingFetch(): typeof fetch {
+  return (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    await new Promise<never>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+    return sseResponse(FIXED_SSE); // 不可达
+  }) as typeof fetch;
+}
+
+test('stream: 连接/首字节超时以可重试 TIMEOUT 结束并释放并发额度', async () => {
+  const gate = new KeyedConcurrencyGate();
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    concurrencyGate: gate,
+    timeouts: { connectMs: 50 },
+    fetchImpl: hangingFetch(),
+  });
+
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    assert.equal((err as LlmError).code, 'TIMEOUT', '连接超时映射可重试 TIMEOUT');
+    return true;
+  });
+  assert.equal((gate as unknown as { states: Map<string, unknown> }).states.size, 0, '超时后并发额度已释放');
+});
+
+test('stream: 宿主 signal abort 保持原样透传（不被连接超时改写为 TIMEOUT）', async () => {
+  const controller = new AbortController();
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    timeouts: { connectMs: 5_000 },
+    fetchImpl: hangingFetch(),
+  });
+
+  const pending = collect(adapter, { ...OPTIONS, signal: controller.signal });
+  await new Promise((r) => setTimeout(r, 10));
+  controller.abort();
+  await assert.rejects(pending, (err: unknown) => (err as Error).name === 'AbortError', '宿主取消以 AbortError 原样抛出');
+});
+
+test('stream: 流空闲看门狗回收停摆流（TIMEOUT）并释放并发额度', async () => {
+  const gate = new KeyedConcurrencyGate();
+  const encoder = new TextEncoder();
+  // 只发一个 chunk 后静默且不 close 的流。
+  const stalledStream = () => new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+        // 故意不 close：模拟流中途停摆
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    concurrencyGate: gate,
+    timeouts: { streamIdleMs: 50 },
+    fetchImpl: (async () => stalledStream()) as typeof fetch,
+  });
+
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    assert.equal((err as LlmError).code, 'TIMEOUT', '流停摆按可重试 TIMEOUT 结束');
+    return true;
+  });
+  assert.equal((gate as unknown as { states: Map<string, unknown> }).states.size, 0, '看门狗触发后并发额度已释放');
+});
+
+test('stream: 流空闲看门狗收到事件即重置，持续输出的流不受影响', async () => {
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    timeouts: { streamIdleMs: 50 },
+    fetchImpl: (async () => sseResponse(FIXED_SSE)) as typeof fetch,
+  });
+  const chunks = await collect(adapter, OPTIONS);
+  assert.ok(chunks.some((c) => c.type === 'finish'), '持续有事件的流正常完成');
+});
+
+test('stream: 健康长流（总时长超过 connectMs）不被连接超时中断', async () => {
+  // 回归：连接超时只约束建连/首包；响应头到达后计时器必须清除，body 阶段不得被误杀。
+  const encoder = new TextEncoder();
+  const slowHealthyStream = () => new Response(
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (let i = 0; i < 8; i += 1) {
+          await new Promise((r) => setTimeout(r, 20)); // 每 20ms 一个 chunk，总时长 ~160ms > connectMs 50ms
+          controller.enqueue(encoder.encode(`data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n`));
+        }
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    timeouts: { connectMs: 50, streamIdleMs: 5_000 },
+    fetchImpl: (async () => slowHealthyStream()) as typeof fetch,
+  });
+  const chunks = await collect(adapter, OPTIONS);
+  assert.ok(chunks.some((c) => c.type === 'finish'), '总时长超过连接超时的健康流正常完成');
+});
+
+test('stream: quotaRotation 环回状态跨请求记忆，双 key 饱和时不乒乓；成功后重置', async () => {
+  const rotateCalls: Array<{ rejected: string; rejection: string }> = [];
+  const usedKeys: string[] = [];
+  let key2Mode: '429' | 'ok' = '429';
+  const rateBody = JSON.stringify({ error: { message: 'rpm exhausted', type: 'quota_exceeded_error', code: 8 } });
+  const adapter = new SensenovaAdapter({
+    options: () => ({ ...CONNECTION, accountCount: 2, quotaRotation: true }),
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async (rejected, rejection) => {
+      rotateCalls.push({ rejected, rejection });
+      return rejected === 'key-1' ? 'key-2' : 'key-1';
+    },
+    fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const key = String((init?.headers as Record<string, string>).authorization).replace('Bearer ', '');
+      usedKeys.push(key);
+      if (key === 'key-2' && key2Mode === 'ok') return sseResponse(FIXED_SSE);
+      return new Response(rateBody, { status: 429 });
+    }) as typeof fetch,
+  });
+
+  // 第一轮：k1→k2 均饱和，环回抛 RATE_LIMIT，sticky=k2、环回标记生效。
+  //（rotateApiKey 被调用 2 次：k1→k2 生效；k2→k1 因 tried 拦下但探测调用已计数。）
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).code, 'RATE_LIMIT');
+    return true;
+  });
+  assert.equal(rotateCalls.length, 2);
+  assert.deepEqual(usedKeys, ['key-1', 'key-2']);
+
+  // 第二轮（宿主退避后重试同一会话）：从粘住的 k2 起步，429 后不再轮换（不乒乓）。
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).code, 'RATE_LIMIT');
+    return true;
+  });
+  assert.equal(rotateCalls.length, 2, '环回后宿主重试不再切换 key');
+  assert.deepEqual(usedKeys, ['key-1', 'key-2', 'key-2']);
+
+  // 第三轮：k2 配额恢复成功 → 环回标记清除。
+  key2Mode = 'ok';
+  const ok = await collect(adapter, OPTIONS);
+  assert.ok(ok.some((c) => c.type === 'finish'), '粘住的 key 恢复后正常完成');
+
+  // 第四轮：k2 再次饱和 → 环回标记已清除，可再次轮换（k2→k1→k2 环回后停留）。
+  key2Mode = '429';
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.equal((err as LlmError).code, 'RATE_LIMIT');
+    return true;
+  });
+  assert.equal(rotateCalls.length, 4, '成功后环回标记清除，配额类 429 可再次轮换');
+  // 第四轮实际发请求：k2、k1（k1→k2 的探测被 tried 拦下，不发请求）。
+  assert.deepEqual(usedKeys, ['key-1', 'key-2', 'key-2', 'key-2', 'key-2', 'key-1']);
+});
+
+test('stream: 并发闸排队超时以可重试 TIMEOUT 结束且不占额度', async () => {
+  const gate = new KeyedConcurrencyGate();
+  let releaseFirst!: () => void;
+  const firstHolds = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    concurrencyGate: gate,
+    timeouts: { queueMs: 40 },
+    fetchImpl: (async () => {
+      await firstHolds;
+      return sseResponse(FIXED_SSE);
+    }) as typeof fetch,
+  });
+  // 第一个请求占住唯一额度（缺省并发 1）。
+  const first = collect(adapter, OPTIONS);
+  await new Promise((r) => setTimeout(r, 10));
+  // 第二个请求排队，40ms 后超时。
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    assert.equal((err as LlmError).code, 'TIMEOUT', '排队超时映射可重试 TIMEOUT');
+    return true;
+  });
+  assert.equal((gate as unknown as { states: Map<string, unknown> }).states.size, 1, '排队超时不占额度（仅 first 在途）');
+  releaseFirst();
+  await first;
+});
+
+test('stream: quotaRotation 开启时配额类 429 切 key 重试并粘住新 key', async () => {
+  const rotateCalls: Array<{ rejected: string; rejection: string }> = [];
+  const usedKeys: string[] = [];
+  const rateBody = JSON.stringify({ error: { message: 'rpm exhausted', type: 'quota_exceeded_error', code: 8 } });
+  const adapter = new SensenovaAdapter({
+    options: () => ({ ...CONNECTION, accountCount: 2, quotaRotation: true }),
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async (rejected, rejection) => {
+      rotateCalls.push({ rejected, rejection });
+      return rejected === 'key-1' ? 'key-2' : 'key-1';
+    },
+    fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const key = String((init?.headers as Record<string, string>).authorization).replace('Bearer ', '');
+      usedKeys.push(key);
+      if (key === 'key-1') return new Response(rateBody, { status: 429 });
+      return sseResponse(FIXED_SSE);
+    }) as typeof fetch,
+  });
+
+  const chunks = await collect(adapter, OPTIONS);
+  assert.ok(chunks.some((c) => c.type === 'finish'), '切换到 key-2 后本次请求重试成功');
+  assert.deepEqual(rotateCalls, [{ rejected: 'key-1', rejection: 'quota-exhausted' }], '配额类 429 以 quota-exhausted 轮换（不写账号状态）');
+  assert.deepEqual(usedKeys, ['key-1', 'key-2'], '同一请求内切到 key-2 重试');
+
+  // 后续请求：resolveApiKey 仍返回 key-1，但粘性指针让请求直接从 key-2 起步。
+  const second = await collect(adapter, OPTIONS);
+  assert.ok(second.some((c) => c.type === 'finish'));
+  assert.equal(rotateCalls.length, 1, '粘住 key-2，未再次轮换');
+  assert.deepEqual(usedKeys, ['key-1', 'key-2', 'key-2'], '后续请求直接使用粘住的 key-2');
+});
+
+test('stream: quotaRotation 关闭时配额类 429 不轮换（行为与现状一致）', async () => {
+  const rotateCalls: Array<{ rejected: string; rejection: string }> = [];
+  let calls = 0;
+  const rateBody = JSON.stringify({ error: { message: 'rpm exhausted', type: 'quota_exceeded_error', code: 8 } });
+  const adapter = new SensenovaAdapter({
+    options: () => ({ ...CONNECTION, accountCount: 2 }), // quotaRotation 缺省 = 关
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async (rejected, rejection) => {
+      rotateCalls.push({ rejected, rejection });
+      return 'key-2';
+    },
+    fetchImpl: (async () => {
+      calls += 1;
+      return new Response(rateBody, { status: 429 });
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    const e = err as LlmError;
+    assert.equal(e.code, 'RATE_LIMIT');
+    assert.equal(e.failure.providerRetryAfterMs, 15_000, '配额类退避下限仍生效');
+    return true;
+  });
+  assert.equal(calls, 1, '不换 key 重试');
+  assert.equal(rotateCalls.length, 0, '不触发账号轮换');
+});
+
+test('stream: quotaRotation 环回无新 key 时停留在当前 key 抛 RATE_LIMIT（退避下限生效）', async () => {
+  const rotateCalls: Array<{ rejected: string; rejection: string }> = [];
+  const usedKeys: string[] = [];
+  const rateBody = JSON.stringify({ error: { message: 'inference tpm exhausted', type: 'invalid_request_error', code: 429001 } });
+  const adapter = new SensenovaAdapter({
+    options: () => ({ ...CONNECTION, accountCount: 2, quotaRotation: true }),
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async (rejected, rejection) => {
+      rotateCalls.push({ rejected, rejection });
+      // 模拟 pool.resolveKey({ exclude: rejectedKey })：两把 key 中排除被拒者返回另一把。
+      return rejected === 'key-1' ? 'key-2' : 'key-1';
+    },
+    fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const key = String((init?.headers as Record<string, string>).authorization).replace('Bearer ', '');
+      usedKeys.push(key);
+      return new Response(rateBody, { status: 429 });
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(collect(adapter, OPTIONS), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    const e = err as LlmError;
+    assert.equal(e.code, 'RATE_LIMIT');
+    assert.equal(e.failure.providerRetryAfterMs, 60_000, '环回后按 TPM 退避下限等待');
+    return true;
+  });
+  assert.deepEqual(rotateCalls.map((c) => c.rejection), ['quota-exhausted', 'quota-exhausted'], '两次均为配额类轮换（不禁用）');
+  assert.deepEqual(usedKeys, ['key-1', 'key-2'], '切到 key-2 仍被拒后环回');
+  assert.equal(usedKeys.filter((k) => k === 'key-1').length, 1, '环回 key-1 已试过 → 停留在 key-2，不重复切换');
+});
+
+test('resolveAdapterOptions: quotaRotation 缺省 false，显式 true 透传', () => {
+  assert.equal(resolveAdapterOptions({}).quotaRotation, false);
+  assert.equal(resolveAdapterOptions({ quotaRotation: true }).quotaRotation, true);
+  assert.equal(resolveAdapterOptions({ quotaRotation: false }).quotaRotation, false);
 });

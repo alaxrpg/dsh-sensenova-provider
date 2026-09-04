@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_QUEUE_TIMEOUT_MS,
   KeyedConcurrencyGate,
   normalizeConcurrencyLimit,
 } from '../src/concurrency.ts';
@@ -123,11 +124,60 @@ test('KeyedConcurrencyGate: 排队等待期间中止 → 取消错误且不占�
   release();
 });
 
+test('KeyedConcurrencyGate: 排队超时默认常量（design D4，2026-09-04 实测）', () => {
+  assert.equal(DEFAULT_QUEUE_TIMEOUT_MS, 60_000);
+});
+
 test('KeyedConcurrencyGate: 空条目排空后惰性删除', async () => {
   const gate = new KeyedConcurrencyGate();
   const release = await gate.acquire('k1', 1);
   release();
   assert.equal((gate as unknown as { states: Map<string, unknown> }).states.size, 0, '排空后条目被删除');
+});
+
+test('KeyedConcurrencyGate: 排队超时 → TimeoutError reject 且不占额度、从队列移除', async () => {
+  const gate = new KeyedConcurrencyGate();
+  const first = await gate.acquire('k1', 1);
+  const queued = gate.acquire('k1', 1, undefined, 30);
+  await assert.rejects(queued, (err: unknown) => {
+    assert.ok(err instanceof DOMException);
+    assert.equal(err.name, 'TimeoutError', '排队超时以 TimeoutError reject（adapter 层映射为可重试 LlmError TIMEOUT）');
+    return true;
+  });
+  // 超时者已从队列移除且不占额度：释放后下一个可立即获取。
+  const next = gate.acquire('k1', 1);
+  first();
+  const release = await next;
+  release();
+  assert.equal((gate as unknown as { states: Map<string, unknown> }).states.size, 0, '排空后条目被删除');
+});
+
+test('KeyedConcurrencyGate: 排队超时清 abort listener，超时后中止不产生副作用', async () => {
+  const gate = new KeyedConcurrencyGate();
+  const controller = new AbortController();
+  const first = await gate.acquire('k1', 1);
+  const queued = gate.acquire('k1', 1, controller.signal, 30);
+  await assert.rejects(queued, (err: unknown) => (err as Error).name === 'TimeoutError');
+  // 超时路径已清 listener；此时 abort 不得把超时错误改写或产生未处理拒绝。
+  controller.abort();
+  // 队列已空，后续获取不受影响。
+  const next = gate.acquire('k1', 1);
+  first();
+  const release = await next;
+  release();
+});
+
+test('KeyedConcurrencyGate: 排队正常唤醒时超时定时器被清理（可继续使用）', async () => {
+  const gate = new KeyedConcurrencyGate();
+  const first = await gate.acquire('k1', 1);
+  const queued = gate.acquire('k1', 1, undefined, 30);
+  first();
+  const release = await queued;
+  release();
+  // 等待超过原超时窗口：若定时器未被清理会在此触发错误/泄漏。
+  await new Promise((r) => setTimeout(r, 50));
+  const again = await gate.acquire('k1', 1);
+  again();
 });
 
 test('stream: 缺省并发上限为 1，同一 key 串行', async () => {

@@ -18,6 +18,8 @@ export const DEFAULT_API_BASE = 'https://token.sensenova.cn/v1';
 export const DEFAULT_API_KEY_ENV = 'SENSENOVA_API_KEY';
 /** 默认每 key 并发生成请求上限（并发闸缺省值）。 */
 export const DEFAULT_CONCURRENCY = 1;
+/** 默认关闭「配额类 429 换 key」（尊重既有「429 不换 key」决策，见 design D5）。 */
+export const DEFAULT_QUOTA_ROTATION = false;
 
 /** 把并发上限输入归一化为正整数（非法/无法解析回退默认 1）。 */
 export function normalizeConcurrency(value: unknown): number {
@@ -29,8 +31,13 @@ export function normalizeConcurrency(value: unknown): number {
   return DEFAULT_CONCURRENCY;
 }
 
+/** 把 quotaRotation 存储值归一化为布尔（仅严格 true 视为开，其余回退默认关）。 */
+export function normalizeQuotaRotation(value: unknown): boolean {
+  return value === true ? true : DEFAULT_QUOTA_ROTATION;
+}
+
 /** 可编辑的设置字段。 */
-export type FieldName = 'apiBase' | 'apiKeyEnv' | 'activeAccount' | 'concurrency' | 'modelSelectionInclude' | 'modelSelectionExclude';
+export type FieldName = 'apiBase' | 'apiKeyEnv' | 'activeAccount' | 'concurrency';
 
 /** accounts 数组元素（与冻结契约一致）。 */
 export interface AccountConfig {
@@ -48,6 +55,8 @@ export interface SenseNovaConfig {
   modelSelection?: { include?: string[]; exclude?: string[] };
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
   concurrency?: number;
+  /** 配额类 429 是否粘性换 key（默认 false；开启后 401 行为不变，429 仍不冷却账号）。 */
+  quotaRotation?: boolean;
 }
 
 /** credentials 域提供的面（对齐参考实现的 remote.credentials）。 */
@@ -124,10 +133,10 @@ export interface SettingsState {
   totalCount: number;
   concurrency: number;
   concurrencyDraft: string;
-  modelSelectionInclude: string[];
-  modelSelectionExclude: string[];
-  modelSelectionIncludeDraft: string;
-  modelSelectionExcludeDraft: string;
+  /** 配额类 429 粘性换 key 开关（实际生效值，默认 false）。 */
+  quotaRotation: boolean;
+  /** 开关的当前展示值（含未保存 staged）。 */
+  quotaRotationDraft: boolean;
   dirty: boolean;
   saving: boolean;
   failed: boolean;
@@ -190,32 +199,6 @@ function apiBaseOf(apiBase: unknown): string {
 }
 
 /** 从 section 值中解析 stored accounts（过滤非法条目）。 */
-function modelIdsOf(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const value of raw) {
-    if (typeof value !== 'string') continue;
-    const id = value.trim();
-    if (id !== '' && !seen.has(id)) {
-      seen.add(id);
-      out.push(id);
-    }
-  }
-  return out;
-}
-
-/** textarea 领域解析：换行或逗号分隔，规范化并稳定去重。 */
-export function parseModelIds(text: string): string[] {
-  return modelIdsOf(text.split(/[\n,]+/));
-}
-
-function modelSelectionOf(raw: unknown): { include: string[]; exclude: string[] } {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { include: [], exclude: [] };
-  const selection = raw as Record<string, unknown>;
-  return { include: modelIdsOf(selection.include), exclude: modelIdsOf(selection.exclude) };
-}
-
 function storedAccountsOf(raw: unknown): AccountConfig[] {
   if (!Array.isArray(raw)) return [];
   const out: AccountConfig[] = [];
@@ -243,8 +226,7 @@ export class SenseNovaSettingsController {
   private stagedApiKeyEnv: string | undefined;
   private stagedActiveAccount: string | undefined;
   private stagedConcurrency: string | undefined;
-  private stagedModelSelectionInclude: string | undefined;
-  private stagedModelSelectionExclude: string | undefined;
+  private stagedQuotaRotation: boolean | undefined;
 
   private defaultKeyDraft = '';
   private defaultClearStaged = false;
@@ -320,8 +302,8 @@ export class SenseNovaSettingsController {
     const apiBase = apiBaseOf(this.sectionValue('apiBase'));
     const apiKeyEnv = credentialRefOf(this.sectionValue('apiKeyEnv')) ?? '';
     const activeAccount = typeof this.sectionValue('activeAccount') === 'string' ? (this.sectionValue('activeAccount') as string) : '';
-    const modelSelection = modelSelectionOf(this.sectionValue('modelSelection'));
     const concurrency = normalizeConcurrency(this.sectionValue('concurrency'));
+    const quotaRotation = normalizeQuotaRotation(this.sectionValue('quotaRotation'));
     const effectiveActiveAccountId = this.effectiveActiveAccountId(activeAccount, defaultView?.configured ?? false);
     const effectiveActiveAccountLabel = this.effectiveActiveAccountLabel(effectiveActiveAccountId, accounts);
     const configuredCount = (defaultView?.configured ? 1 : 0) + accounts.filter((a) => a.configured).length;
@@ -332,8 +314,7 @@ export class SenseNovaSettingsController {
       this.stagedApiKeyEnv !== undefined ||
       this.stagedActiveAccount !== undefined ||
       this.stagedConcurrency !== undefined ||
-      this.stagedModelSelectionInclude !== undefined ||
-      this.stagedModelSelectionExclude !== undefined ||
+      this.stagedQuotaRotation !== undefined ||
       this.defaultKeyDraft !== '' ||
       this.defaultClearStaged ||
       this.addedAccounts.length > 0 ||
@@ -364,10 +345,8 @@ export class SenseNovaSettingsController {
       totalCount,
       concurrency,
       concurrencyDraft: this.stagedConcurrency ?? String(concurrency),
-      modelSelectionInclude: modelSelection.include,
-      modelSelectionExclude: modelSelection.exclude,
-      modelSelectionIncludeDraft: this.stagedModelSelectionInclude ?? modelSelection.include.join('\n'),
-      modelSelectionExcludeDraft: this.stagedModelSelectionExclude ?? modelSelection.exclude.join('\n'),
+      quotaRotation,
+      quotaRotationDraft: this.stagedQuotaRotation ?? quotaRotation,
       dirty,
       saving: this.saving,
       failed: this.failed,
@@ -435,8 +414,6 @@ export class SenseNovaSettingsController {
     else if (field === 'apiKeyEnv') this.stagedApiKeyEnv = text;
     else if (field === 'activeAccount') this.stagedActiveAccount = text;
     else if (field === 'concurrency') this.stagedConcurrency = text;
-    else if (field === 'modelSelectionInclude') this.stagedModelSelectionInclude = text;
-    else this.stagedModelSelectionExclude = text;
     this.failed = false;
     this.publish();
   }
@@ -524,14 +501,20 @@ export class SenseNovaSettingsController {
     this.publish();
   }
 
+  /** 配额类 429 换 key 开关（staged，保存后经 settings 命名空间持久化并热生效）。 */
+  setQuotaRotation(on: boolean): void {
+    this.stagedQuotaRotation = on;
+    this.failed = false;
+    this.publish();
+  }
+
   /** 丢弃所有 staged 编辑。 */
   discard(): void {
     this.stagedApiBase = undefined;
     this.stagedApiKeyEnv = undefined;
     this.stagedActiveAccount = undefined;
     this.stagedConcurrency = undefined;
-    this.stagedModelSelectionInclude = undefined;
-    this.stagedModelSelectionExclude = undefined;
+    this.stagedQuotaRotation = undefined;
     this.defaultKeyDraft = '';
     this.defaultClearStaged = false;
     this.addedAccounts = [];
@@ -698,18 +681,8 @@ export class SenseNovaSettingsController {
         const value = normalizeConcurrency(this.stagedConcurrency);
         await this.scope.set('concurrency', value);
       }
-      if (this.stagedModelSelectionInclude !== undefined || this.stagedModelSelectionExclude !== undefined) {
-        const current = modelSelectionOf(this.sectionValue('modelSelection'));
-        const selection = {
-          include: this.stagedModelSelectionInclude !== undefined
-            ? parseModelIds(this.stagedModelSelectionInclude)
-            : current.include,
-          exclude: this.stagedModelSelectionExclude !== undefined
-            ? parseModelIds(this.stagedModelSelectionExclude)
-            : current.exclude,
-        };
-        if (selection.include.length === 0 && selection.exclude.length === 0) await this.scope.unset('modelSelection');
-        else await this.scope.set('modelSelection', selection);
+      if (this.stagedQuotaRotation !== undefined) {
+        await this.scope.set('quotaRotation', this.stagedQuotaRotation);
       }
       if (this.addedAccounts.length > 0 || this.removedIds.size > 0 || this.labelDrafts.size > 0) {
         await this.writeAccounts();
