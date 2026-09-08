@@ -26,7 +26,7 @@ import { LlmError, assertUsableApiKey } from '@deepseek-ai/dsh-llm';
 import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials';
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment';
 import { SensenovaAccountPool, type AccountSlot } from './accounts.ts';
-import { SensenovaAdapter, type ModelSelection } from './adapter.ts';
+import { SensenovaAdapter } from './adapter.ts';
 
 export const name = 'llm-sensenova';
 export const inject: string[] = ['llm'];
@@ -48,7 +48,6 @@ export interface SensenovaConfig {
   apiBase?: string;
   accounts?: SensenovaAccountConfig[];
   activeAccount?: string;
-  modelSelection?: { include?: string[]; exclude?: string[] };
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
   concurrency?: number;
   /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
@@ -64,10 +63,6 @@ export const Config: z<SensenovaConfig> = z.object({
     apiKeyEnv: z.string().role('credential-ref').default(''),
   })).default([]),
   activeAccount: z.string().default(''),
-  modelSelection: z.object({
-    include: z.array(z.string()).default([]),
-    exclude: z.array(z.string()).default([]),
-  }),
   concurrency: z.natural().min(1).default(1),
   // 高级设置：「配额类 429 换 key」，默认关（design D5：尊重既有「429 不换 key」决策）。
   quotaRotation: z.boolean().default(false),
@@ -91,38 +86,11 @@ export interface ResolvedSensenovaOptions {
   concurrency: number;
   /** 配额类 429 粘性换 key（默认 false）。 */
   quotaRotation: boolean;
-  modelSelection?: ModelSelection;
 }
 
 /** 把配置的并发上限归一化为正整数（非正整数/无法解析回退 1）。 */
 export function normalizeConcurrency(value: unknown): number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : 1;
-}
-
-/** 领域层规范化模型 id：去除首尾空白、过滤空项、稳定去重。 */
-function normalizeModelIds(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const item of value) {
-    if (typeof item !== 'string') continue;
-    const id = item.trim();
-    if (id === '' || seen.has(id)) continue;
-    seen.add(id);
-    result.push(id);
-  }
-  return result;
-}
-
-/** 规范化用户模型选择配置；未配置时保持 undefined，便于 settings unset。 */
-export function normalizeModelSelection(
-  selection: SensenovaConfig['modelSelection'],
-): ModelSelection | undefined {
-  if (selection === undefined || selection === null || typeof selection !== 'object') return undefined;
-  return {
-    include: normalizeModelIds(selection.include),
-    exclude: normalizeModelIds(selection.exclude),
-  };
 }
 
 function resolveSlot(id: string, label: string, value: string): ResolvedAccountSpec {
@@ -150,7 +118,6 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     const label = typeof account.label === 'string' && account.label.trim() !== '' ? account.label.trim() : `Account ${index + 2}`;
     accounts.push(resolveSlot(id, label, refName));
   }
-  const modelSelection = normalizeModelSelection(config.modelSelection);
   return {
     apiBase: config.apiBase ?? DEFAULT_API_BASE,
     activeAccount: typeof config.activeAccount === 'string' ? config.activeAccount : '',
@@ -158,7 +125,6 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     concurrency: normalizeConcurrency(config.concurrency),
     // 防御非布尔输入（程序化构造可能绕过 Schemastery 归一化）。
     quotaRotation: config.quotaRotation === true,
-    ...(modelSelection !== undefined ? { modelSelection } : {}),
   };
 }
 
@@ -235,7 +201,6 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
         accountCount: resolved.accounts.length,
         concurrency: resolved.concurrency,
         quotaRotation: resolved.quotaRotation,
-        ...(resolved.modelSelection !== undefined ? { modelSelection: resolved.modelSelection } : {}),
       };
     },
     resolveApiKey,

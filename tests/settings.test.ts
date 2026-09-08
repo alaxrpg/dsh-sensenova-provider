@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { en, zh } from '../src/client/locales.ts';
 import {
   SenseNovaSettingsController,
   type CredentialsFace,
@@ -299,4 +302,65 @@ test('SenseNovaSettingsController: 快照延迟就绪后重查凭据，额外账
   assert.equal(account.configured, true, '快照就绪后徽标为已配置');
   assert.deepEqual([...(describeCalls.at(-1) ?? [])].sort(), ['SENSENOVA_API_KEY', 'SENSENOVA_API_KEY_2']);
   controller.dispose();
+});
+
+test('SenseNovaSettingsController: 忽略旧 modelSelection 且保存其他字段不回写或清理', async () => {
+  const legacyModelSelection = { include: ['legacy-model'], exclude: ['catalog-model'] };
+  let value = {
+    apiBase: 'https://legacy.example/v1',
+    modelSelection: legacyModelSelection,
+  } as SenseNovaConfig;
+  const setFields: string[] = [];
+  const unsetFields: string[] = [];
+  const listeners = new Set<() => void>();
+  const scope: SettingsScope<SenseNovaConfig> = {
+    getSnapshot: () => ({ status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' }),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async set(field, next) {
+      setFields.push(field);
+      value = { ...value, [field]: next } as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+    async unset(field) {
+      unsetFields.push(field);
+      const next = { ...value } as Record<string, unknown>;
+      delete next[field];
+      value = next as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+  };
+  const credentials: CredentialsFace = {
+    describe: async () => ({ ok: true, value: {} }),
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+  const controller = new SenseNovaSettingsController(scope, credentials);
+
+  assert.equal('modelSelection' in controller.state(), false, '旧字段不进入设置状态');
+  controller.edit('apiBase', 'https://new.example/v1');
+  await controller.save();
+
+  assert.equal(value.apiBase, 'https://new.example/v1');
+  assert.deepEqual((value as unknown as Record<string, unknown>).modelSelection, legacyModelSelection);
+  assert.ok(!setFields.includes('modelSelection'));
+  assert.ok(!unsetFields.includes('modelSelection'));
+  controller.dispose();
+});
+
+test('SenseNova 设置页：高级设置仅保留自动目录说明，不含手动模型控件或废弃文案键', () => {
+  const sectionSource = readFileSync(
+    fileURLToPath(new URL('../src/client/section.tsx', import.meta.url)),
+    'utf8',
+  );
+  for (const deprecatedKey of ['modelInclude', 'modelIncludeHint', 'modelExclude', 'modelExcludeHint']) {
+    assert.equal(deprecatedKey in zh, false, `中文 locale 不应保留 ${deprecatedKey}`);
+    assert.equal(deprecatedKey in en, false, `英文 locale 不应保留 ${deprecatedKey}`);
+    assert.doesNotMatch(sectionSource, new RegExp(`\\b${deprecatedKey}\\b`));
+  }
+  assert.match(sectionSource, /modelsAutoManaged/);
+  assert.match(sectionSource, /sn-api-base/);
+  assert.match(sectionSource, /sn-concurrency/);
+  assert.match(sectionSource, /sn-quota-rotation/);
+  assert.equal(typeof zh.modelsAutoManaged, 'string');
+  assert.equal(typeof en.modelsAutoManaged, 'string');
 });

@@ -19,7 +19,7 @@ const lib = defineConfig({
   clean: true,
   sourcemap: true,
   dts: true,
-  outExtension: () => ({ js: '.js', dts: '.d.ts' }),
+  outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
   external: [
     '@deepseek-ai/cordis',
     '@deepseek-ai/schemastery',

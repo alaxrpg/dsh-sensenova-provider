@@ -52,7 +52,6 @@ export interface SenseNovaConfig {
   apiKeyEnv?: string;
   accounts?: AccountConfig[];
   activeAccount?: string;
-  modelSelection?: { include?: string[]; exclude?: string[] };
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
   concurrency?: number;
   /** 配额类 429 是否粘性换 key（默认 false；开启后 401 行为不变，429 仍不冷却账号）。 */
