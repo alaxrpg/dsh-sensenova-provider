@@ -54,10 +54,12 @@ const MODELS_TIMEOUT_MS = 10_000;
  * 不符——TPM 为 60 秒窗口，提升到 60000ms（spec 允许区间 60–120s 的下沿）。
  */
 const PROVIDER_RETRY_AFTER_CAP_MS = 60_000;
-/** 配额类 429 退避指导（providerRetryAfterMs）的绝对上限（毫秒）：宽松上限，
- * 防止网关异常 Retry-After 把退避拖到分钟级以外；不影响 TPM 分级档（3–15s）与
+/** 配额类 429 退避指导（providerRetryAfterMs）的绝对上限（毫秒）：与
+ * PROVIDER_RETRY_AFTER_CAP_MS（即重试策略单次延迟上限）一致。宿主 dsh-llm-retry
+ * （normal 模式）在 providerRetryAfterMs 超过单次延迟上限时会直接放弃重试，封顶
+ * 对齐后保证任何采用值都会被宿主按指导延迟重试；不影响 TPM 分级档（3–15s）与
  * code 8 固定档（15s）的正常取值。 */
-const QUOTA_RETRY_AFTER_CEILING_MS = 300_000;
+const QUOTA_RETRY_AFTER_CEILING_MS = 60_000;
 /** 配额类 429（code 8，rps/rpm exhausted）退避下限（毫秒）。2026-09-04 实测：速率桶补充 ≈1 个/14s，15s 覆盖一个完整补充周期。 */
 export const QUOTA_RATE_RETRY_FLOOR_MS = 15_000;
 /** 生成请求连接/首字节超时（毫秒）。2026-09-04 实测：传输挂起 ≈1/5 且无 RST，45s 覆盖大 prompt 建连+首包（design D4/D6）。 */
@@ -81,12 +83,6 @@ const KNOWN_EFFORTS: ReadonlyMap<string, readonly string[]> = new Map([
   ['kimi-k3', ['low', 'high', 'max']],
 ]);
 
-/** 手动模型可选覆盖（用户设置持久化）。 */
-export interface ModelSelection {
-  include: readonly string[];
-  exclude: readonly string[];
-}
-
 export interface SensenovaConnection {
   apiBase: string;
   /** 已配置账户槽位总数，用于轮换上限（tried.size < accountCount）。 */
@@ -95,11 +91,7 @@ export interface SensenovaConnection {
   concurrency?: number;
   /** 配额类 429 粘性换 key 开关（默认关；开启后仅配额类 429 触发切换，design D5）。 */
   quotaRotation?: boolean;
-  /** 手动模型可选覆盖；缺省等价于空选择（自动过滤）。 */
-  modelSelection?: ModelSelection;
 }
-
-const EMPTY_MODEL_SELECTION: ModelSelection = { include: [], exclude: [] };
 
 /** 生成请求三段超时注入（毫秒，测试用）；缺省用模块级常量/并发闸默认。 */
 export interface SensenovaTimeouts {
@@ -281,13 +273,11 @@ function reasoningInfoFrom(raw: Record<string, unknown>, modelId: string): LlmMo
   };
 }
 
-/** 解析 OpenAI 模型目录为目录条目；应用自动过滤与手动 include/exclude 覆盖。 */
-function parseCatalog(value: unknown, failedModels: ReadonlySet<string>, selection: ModelSelection): CatalogEntry[] {
+/** 解析 OpenAI 模型目录为目录条目；应用自动过滤与失败缓存。 */
+function parseCatalog(value: unknown, failedModels: ReadonlySet<string>): CatalogEntry[] {
   if (!isRecord(value) || !Array.isArray(value.data)) {
     throw new LlmError('llm-sensenova: unexpected models response shape', 'PROVIDER_PROTOCOL_ERROR');
   }
-  const include = new Set(selection.include);
-  const exclude = new Set(selection.exclude);
   const out: CatalogEntry[] = [];
   for (const raw of value.data) {
     if (!isRecord(raw)) continue;
@@ -297,14 +287,9 @@ function parseCatalog(value: unknown, failedModels: ReadonlySet<string>, selecti
     const output = raw.output_modalities;
     const outputsText = Array.isArray(output) ? output.some((item) => toString(item) === 'text') : false;
     if (!outputsText) continue;
-    // 2) 显式 exclude 优先（即使 include 也排除）。
-    if (exclude.has(id)) continue;
-    // 3) 显式 include 可重新加入目录中的已知/失败 stale 文本模型。
-    // 4) 否则按已知不可路由清单与失败缓存过滤。
-    if (!include.has(id)) {
-      if (KNOWN_UNROUTABLE_MODELS.has(id)) continue;
-      if (failedModels.has(id)) continue;
-    }
+    // 2) 按已知不可路由清单与失败缓存过滤；目录是唯一模型来源。
+    if (KNOWN_UNROUTABLE_MODELS.has(id)) continue;
+    if (failedModels.has(id)) continue;
     const contextWindow = firstContextField(raw);
     const maxOutputTokens = firstMaxOutputField(raw);
     const reasoning = reasoningInfoFrom(raw, id);
@@ -840,7 +825,8 @@ function httpError(status: number, errText: string, retryAfterMs: number | undef
     const floorMs = dynamicFloorMs ?? classified.retryFloorMs;
     let providerRetryAfterMs: number | undefined;
     if (floorMs !== undefined) {
-      // 配额类：退避下限生效，Retry-After 更大时优先，整体封顶 300s（宽松上限）。
+      // 配额类：退避下限生效，Retry-After 更大时优先，整体封顶 60s（对齐单次
+      // 延迟上限，防止宿主因采用值超限而放弃重试）。
       providerRetryAfterMs = Math.min(
         Math.max(floorMs, retryAfterMs !== undefined && retryAfterMs > 0 ? retryAfterMs : 0),
         QUOTA_RETRY_AFTER_CEILING_MS,
@@ -896,10 +882,12 @@ export class SensenovaAdapter extends LlmAdapter {
     return resolveRetryPolicy(
       {
         mode: 'normal',
-        // fix-sensenova-429-quota-retry（design D3）：重试预算有限化——原 1000 次
-        // 在持续限流时呈「无限重试」观感；10 次 × 15–60s 退避（约 3–10 分钟）已
-        // 覆盖可预期的配额恢复窗口，超出应显式失败。
-        maxRetries: 10,
+        // tune-sensenova-429-retry-budget：预算放大（10→100）。fix-sensenova-429-quota-retry
+        // 的 10 次 × 15s 档（约 2 分钟）实测不足以覆盖多会话共享 key 耗干 TPM 桶的恢复
+        // 窗口；100 次 × 15s 封顶档约 25 分钟，仍为有限预算（宿主按步骤边界重置计数，
+        // 此为单个 agent 步骤内预算），更长故障显式失败。分级档位维持 3–15s 封顶不变
+        // （保住恢复第一时间接上的探测灵敏度）。
+        maxRetries: 100,
         backoff: { maxDelayMs: PROVIDER_RETRY_AFTER_CAP_MS },
       },
       'llm-sensenova.retryPolicy',
@@ -930,7 +918,7 @@ export class SensenovaAdapter extends LlmAdapter {
     }
     const parsed: unknown = await response.json();
     // 以新快照原子替换缓存（保留失败标记），避免 listModels 新目录与 resolveModel 旧能力不一致。
-    const models = parseCatalog(parsed, this.failedModels, connection.modelSelection ?? EMPTY_MODEL_SELECTION);
+    const models = parseCatalog(parsed, this.failedModels);
     this.catalog = models;
     return models.map((model) => ({
       provider,

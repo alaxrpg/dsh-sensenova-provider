@@ -19,9 +19,8 @@ function sseResponse(sseText: string): Response {
 }
 
 /** 用固定目录响应构造适配器；models 端点返回给定 data 数组。 */
-function catalogAdapter(data: unknown[], modelSelection?: SensenovaConnection['modelSelection']): SensenovaAdapter {
+function catalogAdapter(data: unknown[], connection: SensenovaConnection = CONNECTION): SensenovaAdapter {
   const body = JSON.stringify({ data });
-  const connection: SensenovaConnection = { ...CONNECTION, ...(modelSelection !== undefined ? { modelSelection } : {}) };
   return new SensenovaAdapter({
     options: () => connection,
     resolveApiKey: async () => 'key-1',
@@ -247,44 +246,24 @@ test('listModels: 过滤文生图模型与已知 stale 模型，保留文本模�
   assert.deepEqual(ids, ['sensenova-6.8-flash-lite', 'sensenova-6.8-pro']);
 });
 
-test('listModels: 手动 include 可恢复 stale，但 exclude 优先且 image-only 永远排除', async () => {
+test('listModels: 旧 modelSelection 不恢复 stale、不隐藏文本模型，image-only 仍排除且未知 id 不合成', async () => {
+  // 旧配置可能仍存在于宿主设置中，但适配器只接受最新 /models 目录及自动过滤结果。
+  const legacyConnection = {
+    ...CONNECTION,
+    modelSelection: {
+      include: ['sensenova-6.7-flash-lite', 'unknown-id'],
+      exclude: ['sensenova-ok'],
+    },
+  } as unknown as SensenovaConnection;
   const adapter = catalogAdapter([
-    { id: 'sensenova-6.7-flash-lite', output_modalities: ['text'], input_modalities: ['text'], context_length: 65536 },
+    { id: 'sensenova-6.7-flash-lite', output_modalities: ['text'], input_modalities: ['text'] },
     { id: 'sensenova-u1-fast', output_modalities: ['image'], input_modalities: ['text'] },
     { id: 'sensenova-ok', output_modalities: ['text'], input_modalities: ['text'] },
-  ], {
-    include: [' sensenova-6.7-flash-lite ', 'sensenova-u1-fast', 'unknown-id'],
-    exclude: ['sensenova-ok', 'sensenova-6.7-flash-lite'],
-  });
+  ], legacyConnection);
+
   const models = await adapter.listModels('sensenova');
-  assert.deepEqual(models.map((model) => model.id), []);
-
-  const restored = catalogAdapter([
-    { id: 'sensenova-6.7-flash-lite', output_modalities: ['text'], input_modalities: ['text'], context_length: 65536 },
-    { id: 'sensenova-u1-fast', output_modalities: ['image'] },
-  ], { include: ['sensenova-6.7-flash-lite', 'sensenova-u1-fast'] });
-  const restoredModels = await restored.listModels('sensenova');
-  assert.deepEqual(restoredModels.map((model) => model.id), ['sensenova-6.7-flash-lite']);
-  const resolved = await restored.resolveModel('sensenova', 'sensenova-6.7-flash-lite');
-  assert.equal(resolved.context?.contextWindow, 65536);
-});
-
-test('listModels: 未出现在最新目录中的手动 include 不合成条目，刷新继续应用配置', async () => {
-  let phase = 0;
-  const adapter = new SensenovaAdapter({
-    options: () => ({ ...CONNECTION, modelSelection: { include: ['sensenova-stale'], exclude: [] } }),
-    resolveApiKey: async () => 'key-1',
-    rotateApiKey: async () => undefined,
-    fetchImpl: (async () => {
-      phase += 1;
-      const data = phase === 1
-        ? [{ id: 'sensenova-stale', output_modalities: ['text'], context_length: 123 }]
-        : [{ id: 'sensenova-ok', output_modalities: ['text'], context_length: 456 }];
-      return new Response(JSON.stringify({ data }), { status: 200 });
-    }) as typeof fetch,
-  });
-  assert.deepEqual((await adapter.listModels('sensenova')).map((model) => model.id), ['sensenova-stale']);
-  assert.deepEqual((await adapter.listModels('sensenova')).map((model) => model.id), ['sensenova-ok']);
+  assert.deepEqual(models.map((model) => model.id), ['sensenova-ok']);
+  assert.equal(models.some((model) => model.id === 'unknown-id'), false);
 });
 
 test('resolveAdapterOptions: 非法 credential-ref 不保留原文且不作为字面 key', () => {
@@ -445,7 +424,7 @@ test('listModels: 显示名标准化（flash-lite 显式映射 + 回退规则）
   assert.equal(byId.get('sensenova-6.8-flash-lite'), 'Sensenova 6.8 Flash Lite');
 });
 
-test('providerRetryPolicy: normal / maxRetries=10 / maxDelayMs=60000', () => {
+test('providerRetryPolicy: normal / maxRetries=100 / maxDelayMs=60000', () => {
   const adapter = new SensenovaAdapter({
     options: () => CONNECTION,
     resolveApiKey: async () => 'key-1',
@@ -455,9 +434,9 @@ test('providerRetryPolicy: normal / maxRetries=10 / maxDelayMs=60000', () => {
   assert.ok(policy);
   assert.equal(policy.mode, 'normal');
   if (policy.mode === 'normal') {
-    // fix-sensenova-429-quota-retry：重试预算有限化（1000→10），退避单次上限对齐
-    // TPM 60s 窗口（3000→60000）。
-    assert.equal(policy.maxRetries, 10);
+    // tune-sensenova-429-retry-budget：预算放大（10→100，100 次 × 15s 封顶档约
+    // 25 分钟），退避单次上限维持 60000（对齐 TPM 60s 窗口）。
+    assert.equal(policy.maxRetries, 100);
     assert.equal(policy.maxDelayMs, 60_000);
     assert.equal(policy.initialDelayMs, 500);
     // 保留默认 jitterRatio；宿主 localDelay 用 Math.min(..., maxDelayMs) 封顶，
@@ -914,7 +893,9 @@ test('stream: 429001 成功后探测档位归零，Retry-After 更大时优先�
     capturedLarger = (err as LlmError).failure.providerRetryAfterMs ?? 0;
     return true;
   });
-  assert.equal(capturedLarger, 90_000, 'Retry-After 更大时优先');
+  // tune-sensenova-429-retry-budget：配额类采用值封顶 60000ms（对齐 maxDelayMs，
+  // 宿主 normal 模式在超过单次延迟上限时会直接放弃重试），90s 被封顶为 60s。
+  assert.equal(capturedLarger, 60_000, 'Retry-After 更大时优先但封顶 60000ms');
 
   // 成功一次（切到 200 OK 的 fetch）后，429001 档位归零回到 3s。
   let mode: 'ok' | '429' = '429';
