@@ -17,11 +17,11 @@ import {
   LlmAdapter,
   LlmError,
   ReasoningEffortId,
-  ToolCallId,
   attributionHeaders,
   errorChain,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm';
+import { ToolCallId } from './brand.ts';
 import type {
   ContentBlock,
   FinishReason,

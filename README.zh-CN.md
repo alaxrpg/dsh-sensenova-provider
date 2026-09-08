@@ -20,6 +20,12 @@
 - DSH 宿主 `>=0.1.2-alpha.3`（alpha 线）。
 - Node.js `>=22`。
 
+> 兼容性说明：运行时导入面是 `@deepseek-ai/dsh-llm` 自 `0.1.1-rc.2` 起就存在的稳定子集
+> （`LlmAdapter`、`LlmError`、`ReasoningEffortId`、`assertUsableApiKey`、
+> `attributionHeaders`、`errorChain`、`resolveRetryPolicy`）；漂移符号 `ToolCallId`
+> 改为本地定义（`src/brand.ts`，恒等返回）。因此在 `0.1.1-rc.2` 宿主上可正常运行时加载；
+> peer 下限 `>=0.1.2-alpha.3` 是类型支持起点（`ToolCallId` 类型首次出现于此版本）。
+
 ## 安装
 
 ```bash

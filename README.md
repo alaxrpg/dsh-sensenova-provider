@@ -20,6 +20,14 @@ Unofficial [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (
 - DSH host `>=0.1.2-alpha.3` (alpha line).
 - Node.js `>=22`.
 
+> Compatibility note: the runtime import surface is a stable subset of
+> `@deepseek-ai/dsh-llm` present since `0.1.1-rc.2` (`LlmAdapter`, `LlmError`,
+> `ReasoningEffortId`, `assertUsableApiKey`, `attributionHeaders`, `errorChain`,
+> `resolveRetryPolicy`); the drifting `ToolCallId` symbol is defined locally
+> (`src/brand.ts`, identity-backed). Runtime loading on `0.1.1-rc.2` hosts works;
+> the declared peer floor `>=0.1.2-alpha.3` is the type-level support start
+> (the `ToolCallId` type first appears there).
+
 ## Install
 
 ```bash
