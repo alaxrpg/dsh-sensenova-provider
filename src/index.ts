@@ -155,12 +155,22 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
     // 允许从已注册但尚未完成当前 fiber 激活态的 host 凭据服务读取；
     // 依赖声明负责启动顺序，strict=false 兼容远端 host 的服务包装层。
     const credentials = ctx.get('credentials', false);
+    let credentialInfo: { configured: boolean; source?: string; writable: boolean } | undefined;
     if (credentials !== undefined) {
       const resolved = await credentials.resolve(ref);
       if (resolved !== undefined && resolved.value !== undefined && resolved.value !== '') return resolved.value;
+      // `describe()` is metadata-only: it never returns the secret. Use it to
+      // distinguish an actually absent ref from a stored-but-unresolvable entry.
+      credentialInfo = await credentials.describe(ref);
     }
     const ambient = launchEnvironmentOf(ctx).get(spec.ref);
     if (ambient !== undefined && ambient.value.length > 0) return ambient.value;
+    if (credentialInfo?.configured === true) {
+      throw new LlmError(
+        `llm-sensenova: credential reference "${spec.ref}" is marked configured but resolved no usable value (source ${credentialInfo.source ?? 'unknown'}, writable ${credentialInfo.writable}); clear and re-save it through the credentials service`,
+        'INVALID_CREDENTIAL',
+      );
+    }
     return undefined;
   };
 

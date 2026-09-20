@@ -226,8 +226,8 @@
 
 #### Scenario: 凭据桥接异常可诊断
 
-- **WHEN** 凭据服务返回 `INVALID_CREDENTIAL` 或其他非 `MISSING_CREDENTIAL` 解析错误
-- **THEN** 系统将错误交给宿主模型目录层，`modelCatalog.failures` SHALL 暴露不含密钥的诊断信息，而非静默返回空分组
+- **WHEN** 凭据服务返回 `INVALID_CREDENTIAL`、标记已配置但解析为空，或其他非 `MISSING_CREDENTIAL` 解析错误
+- **THEN** 系统将错误交给宿主模型目录层，`modelCatalog.failures` SHALL 暴露来源/可写性等不含密钥的诊断信息，而非静默返回空分组
 
 ### Requirement: Web 设置页
 
