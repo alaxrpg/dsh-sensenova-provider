@@ -246,6 +246,29 @@ test('listModels: 过滤文生图模型与已知 stale 模型，保留文本模�
   assert.deepEqual(ids, ['sensenova-6.8-flash-lite', 'sensenova-6.8-pro']);
 });
 
+test('listModels: SenseNova 实际目录保留 5 个文本模型并排除 stale/image-only', async () => {
+  const adapter = catalogAdapter([
+    { id: 'sensenova-6.7-flash-lite', output_modalities: ['text'], input_modalities: ['text', 'image'] },
+    { id: 'deepseek-v4-flash', output_modalities: ['text'], input_modalities: ['text'] },
+    { id: 'glm-5.2', output_modalities: ['text'], input_modalities: ['text'] },
+    { id: 'sensenova-u1-fast', output_modalities: ['image'], input_modalities: ['text'] },
+    { id: 'sensenova-6.8-flash-lite', output_modalities: ['text'], input_modalities: ['text', 'image'] },
+    { id: 'sensenova-u1.5-lite', output_modalities: ['image'], input_modalities: ['text'] },
+    { id: 'deepseek-v4-pro', output_modalities: ['text'], input_modalities: ['text'] },
+    { id: 'kimi-k3', output_modalities: ['text'], input_modalities: ['text'] },
+    { id: 'sensenova-u1.5-fast', output_modalities: ['image'], input_modalities: ['text'] },
+  ]);
+
+  const ids = (await adapter.listModels('sensenova')).map((model) => model.id).sort();
+  assert.deepEqual(ids, [
+    'deepseek-v4-flash',
+    'deepseek-v4-pro',
+    'glm-5.2',
+    'kimi-k3',
+    'sensenova-6.8-flash-lite',
+  ]);
+});
+
 test('listModels: 旧 modelSelection 不恢复 stale、不隐藏文本模型，image-only 仍排除且未知 id 不合成', async () => {
   // 旧配置可能仍存在于宿主设置中，但适配器只接受最新 /models 目录及自动过滤结果。
   const legacyConnection = {
@@ -516,6 +539,30 @@ test('stream: 运行时 404 失败模型写入失败缓存，后续 listModels �
   const after = await adapter.listModels('sensenova');
   assert.ok(!after.some((m) => m.id === 'sensenova-stale'));
   assert.ok(after.some((m) => m.id === 'sensenova-ok'));
+});
+
+test('listModels: 凭据变化后清除旧 MODEL_NOT_FOUND 缓存', async () => {
+  const data = [
+    { id: 'sensenova-recovered', output_modalities: ['text'], input_modalities: ['text'] },
+  ];
+  let activeKey = 'key-1';
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => activeKey,
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async (url: string | URL | Request) => {
+      if (String(url).endsWith('/models')) return new Response(JSON.stringify({ data }), { status: 200 });
+      return new Response(JSON.stringify({ error: { message: 'model route not found' } }), { status: 404 });
+    }) as typeof fetch,
+  });
+
+  assert.equal((await adapter.listModels('sensenova')).length, 1);
+  const options: GenerateOptions = { provider: 'sensenova', model: 'sensenova-recovered', messages: [] };
+  await assert.rejects(collect(adapter, options), (err: unknown) => (err as LlmError).code === 'MODEL_NOT_FOUND');
+  assert.equal((await adapter.listModels('sensenova')).length, 0, '同一 key 保留失败缓存');
+
+  activeKey = 'key-2';
+  assert.equal((await adapter.listModels('sensenova')).length, 1, '换 key 后重新暴露可用模型');
 });
 
 test('stream: 429 Retry-After 超过 60000ms 上限不透传 providerRetryAfterMs，且不轮换不冷却', async () => {

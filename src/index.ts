@@ -29,7 +29,8 @@ import { SensenovaAccountPool, type AccountSlot } from './accounts.ts';
 import { SensenovaAdapter } from './adapter.ts';
 
 export const name = 'llm-sensenova';
-export const inject: string[] = ['llm'];
+// 模型目录首次加载依赖凭据服务；声明依赖避免 host 启动竞态把已配置账户看成无 key。
+export const inject: string[] = ['llm', 'credentials'];
 const NS = 'llm-sensenova';
 const PROVIDER = 'sensenova';
 export const DEFAULT_API_KEY_ENV = 'SENSENOVA_API_KEY';
@@ -108,7 +109,9 @@ function resolveSlot(id: string, label: string, value: string): ResolvedAccountS
  */
 export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenovaOptions {
   const accounts: ResolvedAccountSpec[] = [];
-  const defaultEnv = config.apiKeyEnv ?? DEFAULT_API_KEY_ENV;
+  const defaultEnv = typeof config.apiKeyEnv === 'string' && config.apiKeyEnv.trim() !== ''
+    ? config.apiKeyEnv.trim()
+    : DEFAULT_API_KEY_ENV;
   accounts.push(resolveSlot('default', 'Default', defaultEnv));
   for (const [index, account] of (config.accounts ?? []).entries()) {
     if (account === undefined) continue;
@@ -119,7 +122,9 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     accounts.push(resolveSlot(id, label, refName));
   }
   return {
-    apiBase: config.apiBase ?? DEFAULT_API_BASE,
+    apiBase: typeof config.apiBase === 'string' && config.apiBase.trim() !== ''
+      ? config.apiBase.trim()
+      : DEFAULT_API_BASE,
     activeAccount: typeof config.activeAccount === 'string' ? config.activeAccount : '',
     accounts,
     concurrency: normalizeConcurrency(config.concurrency),

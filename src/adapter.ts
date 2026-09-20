@@ -850,8 +850,11 @@ export class SensenovaAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly gate: KeyedConcurrencyGate;
   private catalog: CatalogEntry[] = [];
-  /** 进程内失败缓存：运行时返回 MODEL_NOT_FOUND 的模型 id，直到适配器生命周期结束。 */
+  /** 进程内失败缓存：运行时返回 MODEL_NOT_FOUND 的模型 id。 */
   private readonly failedModels = new Set<string>();
+  /** 上一次成功目录请求使用的 key/base；变化时旧失败缓存不再可信。 */
+  private catalogCredential: string | undefined;
+  private catalogApiBase: string | undefined;
   /**
    * 配额类 429 粘住 key（design D5，仅 quotaRotation 开启时读写）：
    * 有 sessionId 的请求按会话分桶（同一会话后续请求粘住切换后的 key）；
@@ -917,8 +920,14 @@ export class SensenovaAdapter extends LlmAdapter {
       throw new LlmError(`llm-sensenova: models endpoint returned HTTP ${response.status}`, 'PROVIDER_HTTP_ERROR', { status: response.status });
     }
     const parsed: unknown = await response.json();
-    // 以新快照原子替换缓存（保留失败标记），避免 listModels 新目录与 resolveModel 旧能力不一致。
+    // 失败缓存只对同一凭据和 API 地址成立；换 key 或切换端点后，旧 404 不应继续隐藏新目录。
+    const credentialChanged = this.catalogCredential !== undefined && this.catalogCredential !== apiKey;
+    const apiBaseChanged = this.catalogApiBase !== undefined && this.catalogApiBase !== connection.apiBase;
+    if (credentialChanged || apiBaseChanged) this.failedModels.clear();
+    // 以新快照原子替换缓存，避免 listModels 新目录与 resolveModel 旧能力不一致。
     const models = parseCatalog(parsed, this.failedModels);
+    this.catalogCredential = apiKey;
+    this.catalogApiBase = connection.apiBase;
     this.catalog = models;
     return models.map((model) => ({
       provider,

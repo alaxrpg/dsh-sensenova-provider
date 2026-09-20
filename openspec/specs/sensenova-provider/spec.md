@@ -207,7 +207,7 @@
 #### Scenario: 运行时剔除未知 stale 模型
 
 - **WHEN** 某个目录中的文本模型请求返回 `MODEL_NOT_FOUND`
-- **THEN** 系统将该模型 id 写入进程内失败缓存，后续成功的 `listModels()` 不再返回该模型，直到适配器生命周期结束
+- **THEN** 系统将该模型 id 写入进程内失败缓存，后续成功的 `listModels()` 不再返回该模型，直到适配器生命周期结束；当凭据 key 或 `apiBase` 发生变化时，系统 SHALL 清除该失败缓存并重新评估目录
 
 #### Scenario: 声明多模态输入
 
