@@ -152,7 +152,9 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
     // 防御性校验：即使外部构造了 isLiteral=true，也不得让 ref 原文进入请求。
     if (spec.isLiteral || !isCredentialRefName(spec.ref)) return undefined;
     const ref = credentialRef(spec.ref);
-    const credentials = ctx.get('credentials');
+    // 允许从已注册但尚未完成当前 fiber 激活态的 host 凭据服务读取；
+    // 依赖声明负责启动顺序，strict=false 兼容远端 host 的服务包装层。
+    const credentials = ctx.get('credentials', false);
     if (credentials !== undefined) {
       const resolved = await credentials.resolve(ref);
       if (resolved !== undefined && resolved.value !== undefined && resolved.value !== '') return resolved.value;

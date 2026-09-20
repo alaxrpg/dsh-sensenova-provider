@@ -324,6 +324,21 @@ test('listModels: 无 key 时返回空目录不阻塞', async () => {
   assert.deepEqual(await adapter.listModels('sensenova'), []);
 });
 
+test('listModels: 凭据桥接异常不再静默吞掉', async () => {
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => {
+      throw new LlmError('credential bridge unavailable', 'INVALID_CREDENTIAL');
+    },
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async () => new Response('', { status: 500 })) as typeof fetch,
+  });
+  await assert.rejects(adapter.listModels('sensenova'), (err: unknown) => {
+    assert.ok(err instanceof LlmError);
+    return (err as LlmError).code === 'INVALID_CREDENTIAL';
+  });
+});
+
 test('listModels/resolveModel: 多模态 input_modalities 与上下文/最大输出', async () => {
   const adapter = catalogAdapter([
     {

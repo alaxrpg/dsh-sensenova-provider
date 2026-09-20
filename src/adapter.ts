@@ -902,8 +902,11 @@ export class SensenovaAdapter extends LlmAdapter {
     let apiKey: string;
     try {
       apiKey = await this.deps.resolveApiKey(connection);
-    } catch {
-      return [];
+    } catch (error) {
+      // 没有任何 key 时保持空目录；其他解析/凭据桥接错误必须交给 host，
+      // 否则 modelCatalog 只会静默丢失 provider 分组而没有 failures 诊断。
+      if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return [];
+      throw error;
     }
     const response = await this.fetchImpl(`${connection.apiBase}/models`, {
       headers: {

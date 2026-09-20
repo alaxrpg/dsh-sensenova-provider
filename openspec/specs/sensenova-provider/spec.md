@@ -224,6 +224,11 @@
 - **WHEN** 没有任何账号解析出 key
 - **THEN** 系统返回空模型目录，路由仍保持已注册状态
 
+#### Scenario: 凭据桥接异常可诊断
+
+- **WHEN** 凭据服务返回 `INVALID_CREDENTIAL` 或其他非 `MISSING_CREDENTIAL` 解析错误
+- **THEN** 系统将错误交给宿主模型目录层，`modelCatalog.failures` SHALL 暴露不含密钥的诊断信息，而非静默返回空分组
+
 ### Requirement: Web 设置页
 
 系统 SHALL 提供 Web 设置页，允许配置默认账户密钥、增删账户并通过下拉选择活动账户，并在宿主 Models 页提供 provider 卡片。设置页 SHALL NOT 展示凭据引用名；低频配置字段 SHALL 收纳进默认折叠的高级设置区域；轮换说明文案 SHALL 与实际轮换行为一致：仅 401 自动切换账户；`quotaRotation` 关闭时 429 不切换，开启时仅配额类 429 可切换到下一把 key 并粘住。
