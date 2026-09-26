@@ -75,12 +75,19 @@ export interface CredentialsFace {
   unset(ref: string): Promise<{ ok: boolean }>;
 }
 
-/** 设置 scope 的最小面（对齐 SettingsScope<T>）。 */
+/**
+ * 设置 scope 的最小面。
+ *
+ * 0.1.7 起由 `remote.settings` wire 上的实现（见 `./settings-scope.ts`）提供；
+ * 快照字段与旧宿主 `settingsScope` 同构，额外带宿主 describe 的命名空间 revision。
+ */
 export interface ScopeSnapshot<T> {
   status: 'loading' | 'ready' | 'unavailable';
   value: T | undefined;
   base: unknown;
   user: unknown;
+  /** 宿主 describe 返回的命名空间 revision（并发写入栅栏；旧宿主可能缺省）。 */
+  revision?: number | undefined;
   writable: boolean;
   mode: 'host' | 'memory';
 }
@@ -88,8 +95,12 @@ export interface ScopeSnapshot<T> {
 export interface SettingsScope<T> {
   getSnapshot(): ScopeSnapshot<T>;
   subscribe(fn: () => void): () => void;
-  set(field: string, value: unknown): Promise<void>;
-  unset(field: string): Promise<void>;
+  /** 写入一个字段；返回 false 表示宿主拒绝（例如 revision 冲突后仍失败）。 */
+  set(field: string, value: unknown): Promise<boolean | void>;
+  /** 清除一个字段（回到继承/默认）；返回 false 表示宿主拒绝。 */
+  unset(field: string): Promise<boolean | void>;
+  /** 可选：释放订阅与在途写入（新 wire scope 提供）。 */
+  dispose?(): Promise<void> | void;
 }
 
 /** 页面渲染用的账户行。 */
@@ -609,6 +620,21 @@ export class SenseNovaSettingsController {
     return this.credentialStates.get(canonicalRef)?.configured !== true;
   }
 
+  /**
+   * 写入设置命名空间的一个操作。
+   *
+   * 新 wire scope 会以 `false` 报告「宿主拒绝」（revision 冲突且恢复读取后仍未落地），
+   * 旧宿主 scope 返回 void；两种都由本方法归一化为「是否落地」。
+   */
+  private async writeScope(op: 'set' | 'unset', field: string, value?: unknown): Promise<boolean> {
+    try {
+      const result = op === 'set' ? await this.scope.set(field, value) : await this.scope.unset(field);
+      return result !== false;
+    } catch {
+      return false;
+    }
+  }
+
   /** 持久化 accounts 列表。 */
   private async writeAccounts(): Promise<boolean> {
     const base = [
@@ -627,8 +653,7 @@ export class SenseNovaSettingsController {
         apiKeyEnv: a.apiKeyEnv,
       });
     }
-    await this.scope.set('accounts', list);
-    return true;
+    return this.writeScope('set', 'accounts', list);
   }
 
   /** 保存所有 staged 编辑。 */
@@ -663,28 +688,36 @@ export class SenseNovaSettingsController {
       // 2. 设置字段写入（apiBase / apiKeyEnv / activeAccount / accounts）。
       if (this.stagedApiBase !== undefined) {
         const value = this.stagedApiBase.trim();
-        if (value === '') await this.scope.unset('apiBase');
-        else await this.scope.set('apiBase', value);
+        const ok = value === ''
+          ? await this.writeScope('unset', 'apiBase')
+          : await this.writeScope('set', 'apiBase', value);
+        if (!ok) landed = false;
       }
       if (this.stagedApiKeyEnv !== undefined) {
         const canonicalRef = canonicalCredentialRef(this.stagedApiKeyEnv);
-        if (this.stagedApiKeyEnv.trim() === '') await this.scope.unset('apiKeyEnv');
-        else if (canonicalRef === undefined) landed = false;
-        else await this.scope.set('apiKeyEnv', canonicalRef);
+        if (this.stagedApiKeyEnv.trim() === '') {
+          if (!(await this.writeScope('unset', 'apiKeyEnv'))) landed = false;
+        } else if (canonicalRef === undefined) {
+          landed = false;
+        } else if (!(await this.writeScope('set', 'apiKeyEnv', canonicalRef))) {
+          landed = false;
+        }
       }
       if (this.stagedActiveAccount !== undefined) {
-        if (this.stagedActiveAccount === '') await this.scope.unset('activeAccount');
-        else await this.scope.set('activeAccount', this.stagedActiveAccount);
+        const ok = this.stagedActiveAccount === ''
+          ? await this.writeScope('unset', 'activeAccount')
+          : await this.writeScope('set', 'activeAccount', this.stagedActiveAccount);
+        if (!ok) landed = false;
       }
       if (this.stagedConcurrency !== undefined) {
         const value = normalizeConcurrency(this.stagedConcurrency);
-        await this.scope.set('concurrency', value);
+        if (!(await this.writeScope('set', 'concurrency', value))) landed = false;
       }
       if (this.stagedQuotaRotation !== undefined) {
-        await this.scope.set('quotaRotation', this.stagedQuotaRotation);
+        if (!(await this.writeScope('set', 'quotaRotation', this.stagedQuotaRotation))) landed = false;
       }
       if (this.addedAccounts.length > 0 || this.removedIds.size > 0 || this.labelDrafts.size > 0) {
-        await this.writeAccounts();
+        if (!(await this.writeAccounts())) landed = false;
       }
     } catch {
       landed = false;

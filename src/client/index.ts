@@ -5,8 +5,10 @@
  *   1. 注册 `settings.sensenova` 文案命名空间（zh/en）；
  *   2. 桥接凭据面：优先宿主 `remote.credentials`，旧版退化为
  *      `connection.api.credentials`（与 @mars-sea/dsh-commandcode-provider 同构）；
- *   3. 用 `settingsScope.bind({ namespace: 'llm-sensenova' })` 生成设置域，
- *      交给 SenseNovaSettingsController（领域层，无 JSX）；
+ *   3. 在 `remote.settings` wire 上构建 `llm-sensenova` 设置 scope（见
+ *      `./settings-scope.ts`；0.1.7 已移除宿主的 `settingsScope` 包装服务，而底层
+ *      describe/mutate RPC 覆盖所有受支持版本），交给 SenseNovaSettingsController
+ *      （领域层，无 JSX）；
  *   4. 注入 `settings.section`（设置页）与 `settings.models.provider-card`
  *      （Models 页卡片）两个槽。
  *
@@ -20,9 +22,9 @@ import {
   createSnapshotStore,
   SenseNovaSettingsController,
   type CredentialsFace,
-  type SettingsScope,
   type SenseNovaConfig,
 } from './settings';
+import { createSettingsScope, type SettingsRemoteNamespace } from './settings-scope';
 import { zh, en } from './locales';
 
 /** 旧版 ApiProxy 凭据面（仅作退化路径）。 */
@@ -47,11 +49,11 @@ interface ClientContextLike {
   };
   remote: {
     credentials: CredentialsFace;
+    /** 注入 `remote.settings` 后可见（见 applyClientSurfaces 的嵌套 inject）。 */
+    settings?: SettingsRemoteNamespace;
     $on(event: string, listener: () => void): () => void;
   };
-  settingsScope: {
-    bind(spec: { namespace: string }): SettingsScope<SenseNovaConfig>;
-  };
+  on?(event: string, listener: () => void): (() => void) | void;
   get(name: string): unknown;
   effect(fn: () => (() => void) | void, label: string): void;
   inject(deps: string[], fn: (ctx: ClientContextLike) => void): void;
@@ -177,9 +179,24 @@ function injectPageCss(): void {
 
 /** 在给定的 ctx 上挂载两个槽，共享同一个设置控制器与快照 store。 */
 function applyClientSurfaces(ctx: ClientContextLike, credentials: CredentialsFace): void {
-  const scope = ctx.settingsScope.bind({ namespace: SENSENOVA_NS });
+  // `remote.settings` 是 `remote` 下的嵌套服务：先建 scope，再在注入落地后重读宿主。
+  let settingsNamespace: SettingsRemoteNamespace | undefined;
+  const scope = createSettingsScope<SenseNovaConfig>(ctx, SENSENOVA_NS, () => settingsNamespace);
   const controller = new SenseNovaSettingsController(scope, credentials);
-  ctx.effect(() => () => controller.dispose(), 'dsh-sensenova-provider: settings controller');
+  ctx.effect(() => () => {
+    controller.dispose();
+    void scope.dispose();
+  }, 'dsh-sensenova-provider: settings controller');
+
+  ctx.inject(['remote.settings'], (settingsCtx) => {
+    const namespace = settingsCtx.remote.settings;
+    if (namespace === undefined) return;
+    settingsNamespace = namespace;
+    scope.refresh();
+    settingsCtx.effect(() => () => {
+      settingsNamespace = undefined;
+    }, 'dsh-sensenova-provider: settings namespace');
+  });
 
   const store = createSnapshotStore(controller.state());
   controller.subscribe(() => store.set(controller.state()));
@@ -226,7 +243,15 @@ function applyClientSurfaces(ctx: ClientContextLike, credentials: CredentialsFac
   }, SenseNovaProviderCard) as () => void);
 }
 
-export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope'];
+/**
+ * 客户端服务的静态依赖面。
+ *
+ * 不再声明 `settingsScope`：宿主 0.1.6 之后移除了该包装服务，声明它会让整个 entry
+ * 永久 pending（桌面端 web boot 直接报 “entries did not activate”）。设置域改为在
+ * `remote.settings` wire 上自建（见 `./settings-scope.ts`），因此这里保持 `remote`，
+ * 由 applyClientSurfaces 内部嵌套 `ctx.inject(['remote.settings'], …)` 捕获命名空间。
+ */
+export const inject = ['slots', 'locale', 'connection', 'remote'];
 
 export function apply(ctx: ClientContextLike): void {
   injectPageCss();
