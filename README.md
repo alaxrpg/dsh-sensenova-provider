@@ -8,12 +8,14 @@ Unofficial [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (
 
 - Registers provider route `sensenova` (display name **SenseNova**).
 - Live model catalog via `GET {apiBase}/v1/models`.
-- OpenAI-compatible streaming: `POST {apiBase}/v1/chat/completions` (SSE).
-- Multiple API keys (accounts) on one shared base URL, with automatic rotation:
-  - `429 Too Many Requests` → cooldown the key (honors `Retry-After`; 60 s fallback when absent).
-  - `401 Unauthorized` → disable the key until the stored credential changes.
-  - All keys exhausted → surfaces `RATE_LIMIT` / `INVALID_CREDENTIAL` with the earliest reset time.
+- Streaming over both wire protocols: `POST {apiBase}/v1/responses` (default, see below) and `POST {apiBase}/v1/chat/completions` (SSE; automatic fallback).
+- Multiple API keys (accounts) on one shared base URL:
+  - `429 Too Many Requests` → does **not** cool down or rotate the key (protects the server-side per-key prompt cache); raises `RATE_LIMIT` with `providerRetryAfterMs` for the host retry layer (honors `Retry-After`, capped at 60 s; quota-class 429s carry a backoff floor). With `quotaRotation` enabled, quota-class 429s stickily switch to the next untried key.
+  - `401 Unauthorized` → rotate to the next key; the rejected key stays disabled until the stored credential changes.
+  - All keys exhausted → surfaces `RATE_LIMIT` / `INVALID_CREDENTIAL`.
 - Web settings page (Models-page card + dedicated settings section).
+- Default wire protocol is **Responses** (`auto` mode): used whenever the request can be expressed faithfully, and automatically downgraded to Chat Completions when semantics would be lost (e.g. a `stop` sequence, or a reasoning effort away from the model's Responses default). Notable Responses differences: `max_output_tokens` counts reasoning tokens, `temperature` defaults to 0.6 (Chat uses 1), reasoning is replayed as a summary only, and `stop` is not supported (auto-downgrades to Chat).
+- Image inputs: outbound images in production depend on a host-side attachment bridge (the `0.1.7-rc.2` adapter type surface has no channel for it yet). In this version images are sent as host-generated text placeholders — never silently dropped; the bridge is a follow-up host dependency.
 
 ## Requirements
 
@@ -52,6 +54,8 @@ The plugin installs a `llm-sensenova` settings section with these fields:
 | `apiKeyEnv` | credential-ref | `SENSENOVA_API_KEY` | Default account credential reference. |
 | `accounts[]` | array | `[]` | Extra accounts: `{ id, label, apiKeyEnv }`. |
 | `activeAccount` | string | `""` | Preferred account id; empty means auto / first usable. |
+| `wireProtocol` | `auto`/`responses`/`chat-completions` | `auto` | Wire protocol mode: `auto` prefers Responses and downgrades to Chat when semantics would be lost; forcing `responses` errors on requests it cannot express; `chat-completions` is the legacy escape hatch. |
+| `reasoningSummary` | `auto`/`concise`/`detailed` | `auto` | Responses-only: verbosity of the reasoning summary (`reasoning.summary`). |
 
 API keys are stored through the DSH credentials service; they are never logged and never sent to the model.
 

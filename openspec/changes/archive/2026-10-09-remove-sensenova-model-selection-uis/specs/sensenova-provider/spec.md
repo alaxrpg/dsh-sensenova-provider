@@ -30,6 +30,11 @@
 - **WHEN** 没有任何账号解析出 key
 - **THEN** 系统返回空模型目录，路由仍保持已注册状态
 
+#### Scenario: 凭据桥接异常可诊断
+
+- **WHEN** 凭据服务返回 `INVALID_CREDENTIAL`、标记已配置但解析为空，或其他非 `MISSING_CREDENTIAL` 解析错误
+- **THEN** 系统将错误交给宿主模型目录层，`modelCatalog.failures` SHALL 暴露来源/可写性等不含密钥的诊断信息，而非静默返回空分组
+
 #### Scenario: 旧 modelSelection 被忽略
 - **WHEN** 用户设置中仍存在 `modelSelection.include` 或 `modelSelection.exclude`，且其值试图重新加入 stale 模型或隐藏自动目录模型
 - **THEN** 系统忽略这些字段，目录仍严格遵循最新 `{apiBase}/models`、自动过滤和失败缓存结果

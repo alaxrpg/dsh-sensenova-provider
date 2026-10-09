@@ -19,24 +19,21 @@ import {
   ReasoningEffortId,
   attributionHeaders,
   errorChain,
+  projectImagesForTextModel,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from './brand.ts';
 import type {
-  ContentBlock,
   FinishReason,
   GenerateOptions,
   LlmModelInfo,
   LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  Message,
   ModelModality,
   ResolvedRetryPolicy,
   StreamChunk,
   TokenUsage,
-  ToolCallBlock,
-  ToolResultBlock,
 } from '@deepseek-ai/dsh-llm';
 import { parseRetryAfterMs } from './accounts.ts';
 import { DEFAULT_QUEUE_TIMEOUT_MS, KeyedConcurrencyGate, type Release } from './concurrency.ts';
@@ -74,14 +71,16 @@ const MODEL_NOT_FOUND_CODE = 'MODEL_NOT_FOUND';
 const DISPLAY_NAME_OVERRIDES: ReadonlyMap<string, string> = new Map([
   ['sensenova-6.7-flash-lite', 'Sensenova 6.7 Flash Lite'],
 ]);
-/** 官方文档声明的模型族推理档位（值为 API wire 原值）。 */
-const KNOWN_EFFORTS: ReadonlyMap<string, readonly string[]> = new Map([
-  ['sensenova-6.8-flash-lite', ['low', 'medium', 'high', 'none']],
-  ['deepseek-v4-flash', ['low', 'medium', 'high', 'none']],
-  ['deepseek-v4-pro', ['low', 'high', 'max']],
-  ['glm-5.2', ['low', 'medium', 'high', 'none']],
-  ['kimi-k3', ['low', 'high', 'max']],
-]);
+/** 官方文档声明的模型族事实已迁入 src/wire/facts.ts（add-model-facts 2.2）；
+ * adapter 仅消费 factsFor/staticFacts，不复制第二份。 */
+import { factsFor, staticFacts } from './wire/facts.ts';
+/** Chat 请求体构造已迁出至 wire/body-chat.ts（make-responses-default-wire-protocol 4.1，行为不变）。 */
+import { buildChatBody } from './wire/body-chat.ts';
+import { buildResponsesBody, type ReasoningSummary } from './wire/body-responses.ts';
+import { parseResponsesSse } from './wire/sse-responses.ts';
+import { resolveWirePlan, type WireProtocol } from './wire/plan.ts';
+import { prepareImages, type ImageAccessResolver, type PreparedImage } from './wire/blocks.ts';
+import type { WireKind } from './wire/types.ts';
 
 export interface SensenovaConnection {
   apiBase: string;
@@ -91,6 +90,11 @@ export interface SensenovaConnection {
   concurrency?: number;
   /** 配额类 429 粘性换 key 开关（默认关；开启后仅配额类 429 触发切换，design D5）。 */
   quotaRotation?: boolean;
+  /** wire 协议模式（make-responses-default-wire-protocol §5.1；缺省 auto：优先 Responses，
+   * 语义会丢失时按决策表降级 Chat）。 */
+  wireProtocol?: WireProtocol;
+  /** Responses 推理摘要（reasoning.summary；缺省 auto）。 */
+  reasoningSummary?: ReasoningSummary;
 }
 
 /** 生成请求三段超时注入（毫秒，测试用）；缺省用模块级常量/并发闸默认。 */
@@ -122,6 +126,12 @@ export interface SensenovaAdapterDeps {
   concurrencyGate?: KeyedConcurrencyGate;
   /** 三段超时注入（测试用）；缺省为生产常量。 */
   timeouts?: SensenovaTimeouts;
+  /**
+   * 图像来源解析器（add-multimodal-input）：宿主 ImageBlock 只带 attachment 引用，
+   * 字节须经 resolveImageAttachmentAccess 桥接的本地只读路径（或现成 URL）取得。
+   * 缺省 undefined → 图像按宿主 textOnlyImageText 占位出站（不静默丢弃）。
+   */
+  resolveImageAccess?: ImageAccessResolver;
 }
 
 /** 目录条目：宿主所需的能力元数据快照（listModels 后缓存，resolveModel 消费）。 */
@@ -132,6 +142,8 @@ interface CatalogEntry {
   contextWindow?: number;
   maxOutputTokens?: number;
   reasoning?: LlmModelReasoningInfo;
+  /** 目录 supported_sampling_parameters 白名单（模型支持的采样参数列表，缺失时用静态兜底）。 */
+  supportedSamplingParameters?: readonly string[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -160,18 +172,6 @@ function displayNameFor(id: string): string {
   if (words.length === 0) return normalized;
   const titled = words.map((word) => (word.length > 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word));
   return titled.join(' ').replace(/\s+/g, ' ').trim();
-}
-
-/** 递归展平工具结果内容为纯文本。 */
-function toolResultText(blocks: readonly ContentBlock[]): string {
-  return blocks
-    .map((block) => block.type === 'text' ? block.text : block.type === 'tool-result' ? toolResultText(block.content) : '')
-    .join('');
-}
-
-/** 拼出某条消息的可见文本。 */
-function flattenText(message: Message): string {
-  return message.content.filter((block) => block.type === 'text').map((block) => block.text).join('');
 }
 
 /** 从目录条目读取一个正数能力字段（按优先级），缺失/非法返回 undefined。 */
@@ -256,14 +256,29 @@ function hasReasoningSupport(raw: Record<string, unknown>): boolean {
   return thinking === true || isRecord(thinking);
 }
 
-/** 解析目录条目的 reasoning 词表；目录词表优先，静态表仅补全已知且有支持标记的模型。 */
+/** 读取目录 supported_sampling_parameters 白名单；缺失返回 undefined。 */
+function samplingListField(raw: Record<string, unknown>): readonly string[] | undefined {
+  const value = raw.supported_sampling_parameters;
+  if (!Array.isArray(value)) return undefined;
+  const list = value.filter((item): item is string => typeof item === 'string' && item !== '');
+  return list.length > 0 ? list : undefined;
+}
+
+/** 目录未返回 supported_sampling_parameters 时的静态兜底已迁入 src/wire/facts.ts
+ * （静态档案 samplingParameters 字段；kimi-k3 依文档 :2455-2457 补 seed/parallel_tool_calls）。 */
+
+/** 解析目录条目的 reasoning 词表；目录词表优先，静态表仅补全已知且有支持标记的模型。
+ * defaultEffort：目录声明的默认档优先；目录未带（或命中静态表）时回退静态表默认档
+ * （align-request-fields-with-docs 1.2：命中静态表即声明 defaultEffort）。 */
 function reasoningInfoFrom(raw: Record<string, unknown>, modelId: string): LlmModelReasoningInfo | undefined {
   const efforts = effortListField(raw) ?? nestedEffortListField(raw);
-  const knownEfforts = KNOWN_EFFORTS.get(modelId);
-  const selectedEfforts = efforts ?? (knownEfforts !== undefined && hasReasoningSupport(raw) ? knownEfforts : undefined);
+  const knownFacts = staticFacts(modelId);
+  const selectedEfforts = efforts ?? (knownFacts !== undefined && hasReasoningSupport(raw) ? knownFacts.efforts : undefined);
   if (selectedEfforts === undefined || selectedEfforts.length === 0) return undefined;
   const infos = selectedEfforts.map((effort) => ({ id: ReasoningEffortId(effort), name: effort }));
-  const defaultEffort = efforts !== undefined ? defaultEffortField(raw) : undefined;
+  const declaredDefault = efforts !== undefined ? defaultEffortField(raw) : undefined;
+  const fallbackDefault = knownFacts?.defaultEffort ?? undefined;
+  const defaultEffort = declaredDefault ?? fallbackDefault;
   const defaultId = defaultEffort !== undefined && selectedEfforts.includes(defaultEffort)
     ? ReasoningEffortId(defaultEffort)
     : undefined;
@@ -293,6 +308,7 @@ function parseCatalog(value: unknown, failedModels: ReadonlySet<string>): Catalo
     const contextWindow = firstContextField(raw);
     const maxOutputTokens = firstMaxOutputField(raw);
     const reasoning = reasoningInfoFrom(raw, id);
+    const supportedSamplingParameters = samplingListField(raw);
     out.push({
       id,
       name: displayNameFor(id),
@@ -300,87 +316,10 @@ function parseCatalog(value: unknown, failedModels: ReadonlySet<string>): Catalo
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
       ...(reasoning !== undefined ? { reasoning } : {}),
+      ...(supportedSamplingParameters !== undefined ? { supportedSamplingParameters } : {}),
     });
   }
   return out;
-}
-
-/** 把 OpenAI 消息历史翻译为 OpenAI 请求体消息数组。 */
-function toOpenAiMessages(options: GenerateOptions): unknown[] {
-  const systemParts: string[] = [];
-  if (options.system !== undefined && options.system !== '') systemParts.push(options.system);
-  for (const message of options.messages) {
-    if (message.role === 'system') systemParts.push(flattenText(message));
-  }
-  const systemText = systemParts.filter(Boolean).join('\n\n');
-
-  const messages: unknown[] = [];
-  if (systemText !== '') messages.push({ role: 'system', content: systemText });
-  // 历史 assistant tool-call 清洗状态：SenseNova 会对 name/arguments 为空的 tool_call 报 400
-  // （invalid tool_call function, function/name/arguments cannot be empty）。
-  // 上轮失败产生的空 tool_call 不能原样回放：name 为空的调用直接丢弃（含其孤立 tool-result），
-  // arguments 空串补 '{}'，id 空串合成稳定 id 并让对应 tool-result 跟随映射。
-  const toolCallIdRemap = new Map<string, string>();
-  let syntheticToolCallSeq = 0;
-  for (const message of options.messages) {
-    if (message.role === 'system') continue;
-    if (message.role === 'assistant') {
-      const text = flattenText(message);
-      const toolCalls = message.content.filter((block): block is ToolCallBlock => block.type === 'tool-call');
-      const sanitizedCalls = [];
-      for (const call of toolCalls) {
-        if (call.name === '' || call.name === undefined) {
-          continue; // name 为空的失败 tool_call 丢弃；其 tool-result 因映射不到 id 同步被丢弃
-        }
-        syntheticToolCallSeq += 1;
-        const keptId = call.id !== '' && call.id !== undefined ? call.id : `sensenova-sanitized-${syntheticToolCallSeq}`;
-        toolCallIdRemap.set(call.id, keptId);
-        sanitizedCalls.push({
-          id: keptId,
-          type: 'function',
-          function: { name: call.name, arguments: call.arguments !== '' && call.arguments !== undefined ? call.arguments : '{}' },
-        });
-      }
-      if (text === '' && sanitizedCalls.length === 0) continue; // 空壳 assistant 消息（content:null 且无 tool_calls）同样会被拒收
-      const entry: Record<string, unknown> = { role: 'assistant', content: text !== '' ? text : null };
-      if (sanitizedCalls.length > 0) entry.tool_calls = sanitizedCalls;
-      messages.push(entry);
-      continue;
-    }
-    // user 角色：文本 + 工具结果（工具结果映射为 role:"tool"）。
-    const text = flattenText(message);
-    const results = message.content.filter((block): block is ToolResultBlock => block.type === 'tool-result');
-    if (text !== '' || results.length === 0) messages.push({ role: 'user', content: text });
-    for (const result of results) {
-      // 只保留能映射到已回放 tool_call 的结果：丢弃 tool_call 的孤立结果与映射不到的坏历史 id，避免 400。
-      const remappedId = toolCallIdRemap.get(result.toolCallId);
-      if (remappedId === undefined) continue;
-      messages.push({
-        role: 'tool',
-        tool_call_id: remappedId,
-        content: toolResultText(result.content) || '(no output)',
-      });
-    }
-  }
-  return messages;
-}
-
-/** 组装 OpenAI /chat/completions 请求体。 */
-function buildOpenAiBody(options: GenerateOptions): Record<string, unknown> {
-  const tools = (options.tools ?? []).map((tool) => ({
-    type: 'function',
-    function: { name: tool.name, description: tool.description, parameters: tool.parameters },
-  }));
-  return {
-    model: options.model,
-    messages: toOpenAiMessages(options),
-    stream: true,
-    ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
-    ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
-    ...(options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {}),
-    ...(tools.length > 0 ? { tools } : {}),
-    ...(options.reasoningEffort !== undefined ? { reasoning_effort: options.reasoningEffort } : {}),
-  };
 }
 
 /** OpenAI usage → 宿主 TokenUsage（inputTokens 为未缓存输入，缓存读单独计）。 */
@@ -749,6 +688,16 @@ function isModelNotFoundText(errText: string): boolean {
   return lower.includes('model route not found') || lower.includes('model is not found');
 }
 
+/** §5.3：400 响应体是否为 error.type === 'invalid_request_error'（Responses 运行时不符信号）。 */
+function isInvalidRequestError(errText: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(errText);
+    return isRecord(parsed) && isRecord(parsed.error) && parsed.error.type === 'invalid_request_error';
+  } catch {
+    return false;
+  }
+}
+
 /** 是否为 AbortSignal.timeout / 看门狗 / 排队超时产生的 TimeoutError。 */
 function isTimeoutReason(value: unknown): value is Error {
   return value instanceof Error && value.name === 'TimeoutError';
@@ -852,6 +801,9 @@ export class SensenovaAdapter extends LlmAdapter {
   private catalog: CatalogEntry[] = [];
   /** 进程内失败缓存：运行时返回 MODEL_NOT_FOUND 的模型 id。 */
   private readonly failedModels = new Set<string>();
+  /** §5.3 运行时不符兜底：Responses 400 invalid_request_error 的模型 id（进程内，
+   * 不持久化；命中后 resolveWirePlan 第 4 条判定直接降级 Chat）。 */
+  private readonly responsesUnsupported = new Set<string>();
   /** 上一次成功目录请求使用的 key/base；变化时旧失败缓存不再可信。 */
   private catalogCredential: string | undefined;
   private catalogApiBase: string | undefined;
@@ -957,7 +909,42 @@ export class SensenovaAdapter extends LlmAdapter {
 
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.deps.options();
-    const body = JSON.stringify(buildOpenAiBody(options));
+    // 目录条目驱动字段分派（catalog 未命中时静态表兜底；测试适配器常无目录）。
+    const entry = this.catalog.find((m) => m.id === options.model);
+    // §6.1 分派点：factsFor → resolveWirePlan → 按 wire 构建请求体与路径。
+    // wire 一旦选定，整次请求（含所有轮换重试）不再切换——否则同一轮对话会出现
+    // Responses/Chat 混合历史，function_call 与 role:tool 的 id 体系会串。
+    // 唯一例外是下方 400 兜底（且发生在任何内容流出之前）。
+    const facts = factsFor(options.model, entry);
+    const plan = resolveWirePlan(options, connection, facts, this.responsesUnsupported);
+    let wire: WireKind = plan.wire;
+    // add-multimodal-input 2.1：纯文本模型（supportsImages=false）经宿主
+    // projectImagesForTextModel 投影（插件不自造投影）；多模态模型原样携带。
+    const projectedMessages = facts.supportsImages
+      ? options.messages
+      : projectImagesForTextModel(options.messages);
+    const request: GenerateOptions = projectedMessages === options.messages
+      ? options
+      : { ...options, messages: [...projectedMessages] };
+    // 图像载荷按 wire 预解析（格式交集与 kimi URL 降级是 wire 相关的）；400 兜底
+    // 切 wire 时按新 wire 重建（发生在任何内容流出之前，无部分发送风险）。
+    const imagePayloads = new Map<WireKind, Map<string, PreparedImage>>();
+    const payloadsFor = async (w: WireKind): Promise<Map<string, PreparedImage>> => {
+      let payloads = imagePayloads.get(w);
+      if (payloads === undefined) {
+        payloads = await prepareImages(request, entry, w, this.deps.resolveImageAccess);
+        imagePayloads.set(w, payloads);
+      }
+      return payloads;
+    };
+    const buildBody = async (w: WireKind): Promise<string> => JSON.stringify(
+      w === 'responses'
+        ? buildResponsesBody(request, entry, { reasoningSummary: connection.reasoningSummary }, await payloadsFor(w))
+        : buildChatBody(request, entry, await payloadsFor(w)),
+    );
+    let body = await buildBody(wire);
+    // 400 兜底只在本请求内切换一次（§5.3：标记 + 立即换 Chat 重试一次）。
+    let responsesFallbackUsed = false;
     const tried = new Set<string>();
     const limit = connection.concurrency;
     // 三段超时（design D4/D6，2026-09-04 实测）：生产用常量，测试可注入小值。
@@ -1013,7 +1000,7 @@ export class SensenovaAdapter extends LlmAdapter {
             clearTimeout(connectTimer);
             options.signal?.removeEventListener('abort', onHostAbort);
           });
-          attempt = await this.fetchImpl(`${connection.apiBase}/chat/completions`, {
+          attempt = await this.fetchImpl(`${connection.apiBase}${wire === 'responses' ? '/responses' : '/chat/completions'}`, {
             method: 'POST',
             headers: {
               'content-type': 'application/json',
@@ -1046,6 +1033,24 @@ export class SensenovaAdapter extends LlmAdapter {
         }
         const errText = await attempt.text().catch(() => '');
         const retryAfterMs = parseRetryAfterMs(attempt.headers.get('retry-after'));
+        // §5.3 运行时不符兜底：Responses 400 且 error.type=invalid_request_error →
+        // 记进程内 responsesUnsupported 集合 + 打日志，同请求立即换 Chat 重试一次
+        // （发生在任何内容流出之前，是 wire 粘性的唯一例外）；后续该模型直连 Chat。
+        // 不持久化、不写配置——重启即清空，文档与实况不符只退化为「该模型走 Chat」。
+        if (attempt.status === 400 && wire === 'responses' && !responsesFallbackUsed && isInvalidRequestError(errText)) {
+          this.responsesUnsupported.add(options.model);
+          // eslint-disable-next-line no-console -- 适配器不持有 cordis logger，降级说明走 stderr 日志（避免用户困惑）。
+          console.warn(
+            `[dsh-sensenova-provider] responses wire rejected model "${options.model}" with 400 invalid_request_error; ` +
+              'falling back to chat-completions for this and subsequent requests in this process',
+          );
+          wire = 'chat-completions';
+          body = await buildBody(wire);
+          responsesFallbackUsed = true;
+          release();
+          release = undefined;
+          continue;
+        }
         // 404 模型不可路由：标记失败且不轮换/不重试。
         const modelNotFound = attempt.status === 404 && isModelNotFoundText(errText);
         if (modelNotFound) {
@@ -1107,7 +1112,9 @@ export class SensenovaAdapter extends LlmAdapter {
       if (response.body === null) {
         throw new LlmError('llm-sensenova: SenseNova API returned no response body', 'PROVIDER_PROTOCOL_ERROR');
       }
-      yield* parseOpenAiSse(response.body, options.signal, streamIdleMs);
+      yield* wire === 'responses'
+        ? parseResponsesSse(response.body, options.signal, streamIdleMs)
+        : parseOpenAiSse(response.body, options.signal, streamIdleMs);
     } finally {
       for (const cleanup of connectCleanups) cleanup();
       release?.();

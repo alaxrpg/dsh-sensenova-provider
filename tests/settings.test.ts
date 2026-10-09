@@ -364,3 +364,82 @@ test('SenseNova 设置页：高级设置仅保留自动目录说明，不含手�
   assert.equal(typeof zh.modelsAutoManaged, 'string');
   assert.equal(typeof en.modelsAutoManaged, 'string');
 });
+
+test('SenseNovaSettingsController: wireProtocol/reasoningSummary 缺省 auto、staged 保存热生效、非法值归一化（task 5.1/5.3）', async () => {
+  let value: SenseNovaConfig = {};
+  const listeners = new Set<() => void>();
+  const scope: SettingsScope<SenseNovaConfig> = {
+    getSnapshot: () => ({ status: 'ready', value, base: undefined, user: value, writable: true, mode: 'host' }),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async set(field, next) {
+      value = { ...value, [field]: next } as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+    async unset(field) {
+      const next = { ...value } as Record<string, unknown>;
+      delete next[field];
+      value = next as SenseNovaConfig;
+      for (const listener of listeners) listener();
+    },
+  };
+  const credentials: CredentialsFace = {
+    describe: async () => ({ ok: true, value: {} }),
+    set: async () => ({ ok: true }),
+    unset: async () => ({ ok: true }),
+  };
+  const controller = new SenseNovaSettingsController(scope, credentials);
+  assert.equal(controller.state().wireProtocol, 'auto', '缺省 auto');
+  assert.equal(controller.state().reasoningSummary, 'auto');
+  assert.equal(controller.state().dirty, false);
+
+  controller.setWireProtocol('chat-completions');
+  controller.setReasoningSummary('detailed');
+  assert.equal(controller.state().wireProtocolDraft, 'chat-completions', 'staged 立即反映');
+  assert.equal(controller.state().reasoningSummaryDraft, 'detailed');
+  assert.equal(controller.state().wireProtocol, 'auto', '保存前生效值不变');
+  assert.equal(controller.state().dirty, true);
+
+  await controller.save();
+  assert.equal(value.wireProtocol, 'chat-completions', '经 settings 命名空间持久化');
+  assert.equal(value.reasoningSummary, 'detailed');
+  assert.equal(controller.state().wireProtocol, 'chat-completions', '保存即热生效');
+  assert.equal(controller.state().dirty, false);
+
+  controller.setWireProtocol('auto');
+  await controller.save();
+  assert.equal(controller.state().wireProtocol, 'auto', '切回 auto 同样持久化');
+
+  // 存储值为非法字符串时归一化为 auto。
+  value = { wireProtocol: 'grpc' as unknown as SenseNovaConfig['wireProtocol'], reasoningSummary: 1 as unknown as SenseNovaConfig['reasoningSummary'] };
+  for (const listener of listeners) listener();
+  assert.equal(controller.state().wireProtocol, 'auto', '非法存储值回退 auto');
+  assert.equal(controller.state().reasoningSummary, 'auto');
+
+  // discard 丢弃 staged。
+  controller.setReasoningSummary('concise');
+  controller.discard();
+  assert.equal(controller.state().reasoningSummaryDraft, 'auto');
+  assert.equal(controller.state().dirty, false);
+  controller.dispose();
+});
+
+// 双语文案：两下拉全部键 + 五类能力损失提示在 zh/en 均存在（task 5.2）。
+test('locales: wire 协议与推理摘要键、五类能力损失提示双语齐备', () => {
+  const keys = [
+    'wireProtocol', 'wireProtocolAuto', 'wireProtocolResponses', 'wireProtocolChatCompletions', 'wireProtocolHint',
+    'reasoningSummary', 'reasoningSummaryAuto', 'reasoningSummaryConcise', 'reasoningSummaryDetailed', 'reasoningSummaryHint',
+    'wireTradeoffsNote',
+  ];
+  for (const key of keys) {
+    assert.ok(typeof zh[key] === 'string' && zh[key] !== '', `zh.${key} 缺失`);
+    assert.ok(typeof en[key] === 'string' && en[key] !== '', `en.${key} 缺失`);
+  }
+  // 五类能力损失提示合并在 wireTradeoffsNote：档位降级 / 思维链摘要 / stop / max_output_tokens / temperature 默认值。
+  assert.match(zh.wireTradeoffsNote, /降级.*Chat/);
+  assert.match(zh.wireTradeoffsNote, /摘要/);
+  assert.match(zh.wireTradeoffsNote, /stop/);
+  assert.match(zh.wireTradeoffsNote, /推理 token/);
+  assert.match(zh.wireTradeoffsNote, /0\.6/);
+  assert.match(en.wireTradeoffsNote, /downgrade/);
+  assert.match(en.wireTradeoffsNote, /0\.6/);
+});

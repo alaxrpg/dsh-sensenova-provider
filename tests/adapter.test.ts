@@ -6,7 +6,9 @@ import { SensenovaAdapter, type SensenovaConnection } from '../src/adapter.ts';
 import { KeyedConcurrencyGate } from '../src/concurrency.ts';
 import { resolveAdapterOptions } from '../src/index.ts';
 
-const CONNECTION: SensenovaConnection = { apiBase: 'https://example.invalid', accountCount: 2 };
+// 钉死 chat-completions：本文件历史断言全部针对 Chat wire（make-responses-default-wire-protocol
+// 4.4 零回归通道）；Responses 路径的断言在 tests/wire-responses.test.ts。
+const CONNECTION: SensenovaConnection = { apiBase: 'https://example.invalid', accountCount: 2, wireProtocol: 'chat-completions' };
 
 function sseResponse(sseText: string): Response {
   const stream = new ReadableStream<Uint8Array>({
@@ -638,10 +640,10 @@ test('stream: 历史中的空 tool_call（name/arguments/id 为空）被清洗�
         ],
       },
       {
-        role: 'user',
-        content: [
-          { type: 'tool-result', toolCallId: '', content: [{ type: 'text', text: 'Error: invalid arguments' }] },
-        ],
+        // 0.1.7 类型面：工具结果是一等 role:'tool' 消息（toolCallId + content 块）
+        role: 'tool',
+        toolCallId: '',
+        content: [{ type: 'text', text: 'Error: invalid arguments' }],
       },
       { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
     ] as unknown as GenerateOptions['messages'],
@@ -688,7 +690,7 @@ async function assembleBlocks(adapter: SensenovaAdapter, options: GenerateOption
   return assembler.blocks();
 }
 
-test('resolveModel: supported_features 含 reasoning + 静态表命中 → 暴露档位且无 defaultEffort', async () => {
+test('resolveModel: supported_features 含 reasoning + 静态表命中 → 暴露档位并声明静态默认档', async () => {
   const adapter = catalogAdapter([
     { id: 'deepseek-v4-flash', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['tools', 'json_mode', 'reasoning'] },
   ]);
@@ -696,9 +698,9 @@ test('resolveModel: supported_features 含 reasoning + 静态表命中 → 暴�
   const info = await adapter.resolveModel('sensenova', 'deepseek-v4-flash');
   const reasoning = info.reasoning;
   assert.ok(reasoning, '静态表命中的 reasoning 模型应暴露档位');
-  assert.deepEqual(reasoning.efforts.map((e) => e.id), ['low', 'medium', 'high', 'none']);
+  assert.deepEqual(reasoning.efforts.map((e) => e.id), ['low', 'medium', 'high', 'max', 'none']);
   assert.equal(reasoning.efforts[0]?.name, 'low');
-  assert.equal(reasoning.defaultEffort, undefined, '静态表不设 defaultEffort，保持网关默认');
+  assert.equal(reasoning.defaultEffort, 'high', '静态表命中时声明文档默认档（align 1.2）');
 });
 
 test('resolveModel: 命中静态表但目录无 reasoning 标记 → 不暴露档位', async () => {
@@ -729,23 +731,35 @@ test('resolveModel: 目录词表优先于静态表', async () => {
   assert.equal(reasoning.defaultEffort, 'high');
 });
 
-test('resolveModel: 静态表覆盖多个模型族（pro/kimi 官方值域）', async () => {
+test('resolveModel: 静态档位矩阵精确匹配文档表（align 1.1/1.3）', async () => {
   const data = [
     { id: 'deepseek-v4-pro', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
+    { id: 'deepseek-v4-flash', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
+    { id: 'deepseek-flash', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
     { id: 'kimi-k3', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
     { id: 'sensenova-6.8-flash-lite', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
     { id: 'glm-5.2', output_modalities: ['text'], input_modalities: ['text'], supported_features: ['reasoning'] },
   ];
   const adapter = catalogAdapter(data);
   await adapter.listModels('sensenova');
+  // deepseek-v4-pro 已删除静态条目（目录也无词表）→ 不再兜底
   const pro = await adapter.resolveModel('sensenova', 'deepseek-v4-pro');
-  assert.deepEqual(pro.reasoning?.efforts.map((e) => e.id), ['low', 'high', 'max']);
+  assert.equal(pro.reasoning, undefined, 'deepseek-v4-pro 无静态条目');
+  const v4 = await adapter.resolveModel('sensenova', 'deepseek-v4-flash');
+  assert.deepEqual(v4.reasoning?.efforts.map((e) => e.id), ['low', 'medium', 'high', 'max', 'none']);
+  assert.equal(v4.reasoning?.defaultEffort, 'high');
+  const dsf = await adapter.resolveModel('sensenova', 'deepseek-flash');
+  assert.deepEqual(dsf.reasoning?.efforts.map((e) => e.id), ['none', 'low', 'high', 'max']);
+  assert.equal(dsf.reasoning?.defaultEffort, 'high');
   const kimi = await adapter.resolveModel('sensenova', 'kimi-k3');
-  assert.deepEqual(kimi.reasoning?.efforts.map((e) => e.id), ['low', 'high', 'max']);
+  assert.deepEqual(kimi.reasoning?.efforts.map((e) => e.id), ['low', 'medium', 'high', 'max']);
+  assert.equal(kimi.reasoning?.defaultEffort, 'max');
   const sn68 = await adapter.resolveModel('sensenova', 'sensenova-6.8-flash-lite');
-  assert.deepEqual(sn68.reasoning?.efforts.map((e) => e.id), ['low', 'medium', 'high', 'none']);
+  assert.deepEqual(sn68.reasoning?.efforts.map((e) => e.id), ['low', 'medium', 'high', 'max', 'none']);
+  assert.equal(sn68.reasoning?.defaultEffort, 'high');
   const glm = await adapter.resolveModel('sensenova', 'glm-5.2');
-  assert.deepEqual(glm.reasoning?.efforts.map((e) => e.id), ['low', 'medium', 'high', 'none']);
+  assert.deepEqual(glm.reasoning?.efforts.map((e) => e.id), ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none']);
+  assert.equal(glm.reasoning?.defaultEffort, 'max');
 });
 
 test('stream: delta.reasoning_content 与 delta.reasoning 都被映射为 reasoning 增量', async () => {
@@ -1253,4 +1267,135 @@ test('resolveAdapterOptions: quotaRotation 缺省 false，显式 true 透传', (
   assert.equal(resolveAdapterOptions({}).quotaRotation, false);
   assert.equal(resolveAdapterOptions({ quotaRotation: true }).quotaRotation, true);
   assert.equal(resolveAdapterOptions({ quotaRotation: false }).quotaRotation, false);
+});
+
+// ---- align-request-fields-with-docs 新增用例（字段分派） ----
+
+/** 捕获出站请求体的适配器（可选先灌目录：catalog 非空时先 listModels 再 stream）。 */
+async function captureBody(
+  options: GenerateOptions,
+  catalog: unknown[] = [],
+): Promise<Record<string, unknown>> {
+  let requestBody: unknown;
+  let modelsServed = false;
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (catalog.length > 0 && !modelsServed && String(input).endsWith('/models')) {
+        modelsServed = true;
+        return new Response(JSON.stringify({ data: catalog }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      requestBody = JSON.parse(String(init?.body));
+      return sseResponse(FIXED_SSE);
+    }) as typeof fetch,
+  });
+  if (catalog.length > 0) await adapter.listModels('sensenova');
+  await collect(adapter, options);
+  return requestBody as Record<string, unknown>;
+}
+
+const REASONING_HISTORY: GenerateOptions['messages'] = [
+  { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+  {
+    role: 'assistant',
+    content: [
+      { type: 'reasoning', text: 'chain-of-thought-1' },
+      { type: 'text', text: 'answer-1' },
+    ],
+  } as unknown as GenerateOptions['messages'][number],
+  { role: 'user', content: [{ type: 'text', text: 'go on' }] },
+];
+
+const ONE_TOOL: NonNullable<GenerateOptions['tools']> = [{
+  name: 'bash',
+  description: 'run',
+  parameters: { type: 'object', properties: {} },
+} as unknown as NonNullable<GenerateOptions['tools']>[number]];
+
+test('字段分派: kimi-k3 输出上限用 max_completion_tokens，其余模型 max_tokens（align 2.1）', async () => {
+  const kimi = await captureBody({ provider: 'sensenova', model: 'kimi-k3', messages: [], maxTokens: 512 });
+  assert.equal(kimi.max_completion_tokens, 512);
+  assert.equal(kimi.max_tokens, undefined);
+  const other = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: [], maxTokens: 512 });
+  assert.equal(other.max_tokens, 512);
+  assert.equal(other.max_completion_tokens, undefined);
+});
+
+test('字段分派: 四族流式显式 stream_options.include_usage，glm-5.2 不发（align 2.2）', async () => {
+  for (const model of ['sensenova-6.8-flash-lite', 'deepseek-v4-flash', 'deepseek-flash', 'kimi-k3']) {
+    const body = await captureBody({ provider: 'sensenova', model, messages: [] });
+    assert.deepEqual(body.stream_options, { include_usage: true }, `${model} 应显式发送 stream_options`);
+  }
+  const glm = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: [] });
+  assert.equal(glm.stream_options, undefined, 'glm-5.2 不发 stream_options');
+});
+
+test('字段分派: reasoning_content 回放按「deepseek 系且带 tools」判定（align 2.3）', async () => {
+  const msgs = REASONING_HISTORY;
+  // deepseek-v4-flash + tools → 回放
+  const dsTools = await captureBody({ provider: 'sensenova', model: 'deepseek-v4-flash', messages: msgs, tools: ONE_TOOL });
+  const dsReplay = (dsTools.messages as Array<Record<string, unknown>>).filter((m) => m.role === 'assistant');
+  assert.equal(dsReplay[0]?.reasoning_content, 'chain-of-thought-1', 'deepseek+tools 回放思维链');
+  // deepseek-v4-flash 不带 tools → 不回放
+  const dsNoTools = await captureBody({ provider: 'sensenova', model: 'deepseek-v4-flash', messages: msgs });
+  const dsPlain = (dsNoTools.messages as Array<Record<string, unknown>>).filter((m) => m.role === 'assistant');
+  assert.equal(dsPlain[0]?.reasoning_content, undefined, 'deepseek 不带 tools 不回放');
+  // 非 deepseek + tools → 不回放
+  const kimiTools = await captureBody({ provider: 'sensenova', model: 'kimi-k3', messages: msgs, tools: ONE_TOOL });
+  const kimiReplay = (kimiTools.messages as Array<Record<string, unknown>>).filter((m) => m.role === 'assistant');
+  assert.equal(kimiReplay[0]?.reasoning_content, undefined, 'kimi 多轮不回放思维链');
+  // 非 deepseek 不带 tools → 不回放
+  const glm = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: msgs });
+  const glmReplay = (glm.messages as Array<Record<string, unknown>>).filter((m) => m.role === 'assistant');
+  assert.equal(glmReplay[0]?.reasoning_content, undefined, 'glm 不回放思维链');
+});
+
+test('字段分派: kimi-k3 裁剪 temperature 等采样字段（align 2.4）', async () => {
+  const kimi = await captureBody({ provider: 'sensenova', model: 'kimi-k3', messages: [], temperature: 0.3 });
+  assert.equal(kimi.temperature, undefined, 'kimi-k3 不发 temperature');
+  assert.equal(kimi.frequency_penalty, undefined);
+  assert.equal(kimi.presence_penalty, undefined);
+  assert.equal(kimi.top_p, undefined);
+  const glm = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: [], temperature: 0.3 });
+  assert.equal(glm.thinking, undefined, 'glm-5.2 不发 thinking');
+  assert.equal(glm.temperature, 0.3, 'glm temperature 正常发送');
+});
+
+test('字段分派: 目录 supported_sampling_parameters 白名单裁剪（align 2.4）', async () => {
+  // 目录白名单不含 temperature → 不发
+  const restricted = await captureBody(
+    { provider: 'sensenova', model: 'some-model', messages: [], temperature: 0.5 },
+    [{ id: 'some-model', output_modalities: ['text'], supported_sampling_parameters: ['stop'] }],
+  );
+  assert.equal(restricted.temperature, undefined, '白名单未列出 temperature 不发');
+  // 目录白名单含 temperature → 发
+  const allowed = await captureBody(
+    { provider: 'sensenova', model: 'some-model', messages: [], temperature: 0.5 },
+    [{ id: 'some-model', output_modalities: ['text'], supported_sampling_parameters: ['temperature', 'stop'] }],
+  );
+  assert.equal(allowed.temperature, 0.5);
+});
+
+test('字段分派: reasoning_effort 出站策略——原样/兼容映射/未知丢弃（align 2.5）', async () => {
+  // 值域内原样
+  const glm = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: [], reasoningEffort: 'xhigh' as never });
+  assert.equal(glm.reasoning_effort, 'xhigh');
+  // deepseek-flash 兼容映射改写
+  for (const [host, wire] of [['minimal', 'low'], ['medium', 'high'], ['xhigh', 'high'], ['ultra', 'max']] as const) {
+    const body = await captureBody({ provider: 'sensenova', model: 'deepseek-flash', messages: [], reasoningEffort: host as never });
+    assert.equal(body.reasoning_effort, wire, `deepseek-flash ${host}→${wire}`);
+  }
+  // 值域外不发送
+  const kimiBad = await captureBody({ provider: 'sensenova', model: 'kimi-k3', messages: [], reasoningEffort: 'minimal' as never });
+  assert.equal(kimiBad.reasoning_effort, undefined, 'kimi 值域外不发未知值');
+  // kimi none 特例 → thinking:"disabled" + 不发 reasoning_effort（待实测修正）
+  const kimiNone = await captureBody({ provider: 'sensenova', model: 'kimi-k3', messages: [], reasoningEffort: 'none' as never });
+  assert.equal(kimiNone.reasoning_effort, undefined, 'kimi none 不发 reasoning_effort');
+  assert.equal(kimiNone.thinking, 'disabled', 'kimi none → thinking:"disabled"');
+  // glm none 值域内 → 经 reasoning_effort 表达，不发 thinking
+  const glmNone = await captureBody({ provider: 'sensenova', model: 'glm-5.2', messages: [], reasoningEffort: 'none' as never });
+  assert.equal(glmNone.reasoning_effort, 'none');
+  assert.equal(glmNone.thinking, undefined);
 });

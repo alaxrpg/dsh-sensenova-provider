@@ -1,5 +1,14 @@
 import z from "@deepseek-ai/schemastery";
+import "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
+//#region src/wire/plan.d.ts
+/** 插件配置的三种 wire 模式（缺省 auto：优先 Responses，语义会丢失时才降级）。 */
+type WireProtocol = 'auto' | 'responses' | 'chat-completions';
+//#endregion
+//#region src/wire/body-responses.d.ts
+/** Responses 推理摘要配置（reasoning.summary，默认 auto）。 */
+type ReasoningSummary = 'auto' | 'concise' | 'detailed';
+//#endregion
 //#region src/index.d.ts
 export declare const name = "llm-sensenova";
 export declare const inject: string[];
@@ -11,16 +20,24 @@ export interface SensenovaAccountConfig {
   label?: string;
   apiKeyEnv?: string;
 }
-/** 插件配置（schemastery schema 的输出形状，所有字段均可选）。 */
+/** 0.1.7-rc.2 起 volatile 配置字段以稳定引用（{ get() }）形式注入；兼容程序化构造的普通值。 */
+type VolatileLike = {
+  get(): unknown;
+};
+/** 插件配置（schemastery schema 的输出形状，所有字段均可选；volatile 字段可为稳定引用）。 */
 export interface SensenovaConfig {
-  apiKeyEnv?: string;
-  apiBase?: string;
-  accounts?: SensenovaAccountConfig[];
-  activeAccount?: string;
+  apiKeyEnv?: string | VolatileLike;
+  apiBase?: string | VolatileLike;
+  accounts?: SensenovaAccountConfig[] | VolatileLike;
+  activeAccount?: string | VolatileLike;
   /** 每 key 并发生成请求上限（正整数，默认 1）。 */
-  concurrency?: number;
+  concurrency?: number | VolatileLike;
   /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
-  quotaRotation?: boolean;
+  quotaRotation?: boolean | VolatileLike;
+  /** wire 协议模式（缺省 auto：优先 Responses，决策表降级 Chat）。 */
+  wireProtocol?: WireProtocol | VolatileLike;
+  /** Responses 推理摘要（缺省 auto）。 */
+  reasoningSummary?: ReasoningSummary | VolatileLike;
 }
 export declare const Config: z<SensenovaConfig>;
 /** 一个解析后的账户槽位：id/label + 合法 credential-ref 名。 */
@@ -40,7 +57,15 @@ export interface ResolvedSensenovaOptions {
   concurrency: number;
   /** 配额类 429 粘性换 key（默认 false）。 */
   quotaRotation: boolean;
+  /** wire 协议模式（默认 auto）。 */
+  wireProtocol: WireProtocol;
+  /** Responses 推理摘要（默认 auto）。 */
+  reasoningSummary: ReasoningSummary;
 }
+/** 把 wire 协议配置归一化为三值枚举（非法输入回退 auto）。 */
+export declare function normalizeWireProtocol(value: unknown): WireProtocol;
+/** 把推理摘要配置归一化为三值枚举（非法输入回退 auto）。 */
+export declare function normalizeReasoningSummary(value: unknown): ReasoningSummary;
 /** 把配置的并发上限归一化为正整数（非正整数/无法解析回退 1）。 */
 export declare function normalizeConcurrency(value: unknown): number;
 /**

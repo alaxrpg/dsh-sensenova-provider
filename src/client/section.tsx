@@ -40,6 +40,8 @@ export interface SenseNovaSectionProps {
   toggleDefaultKeyClear: () => void;
   setActiveAccount: (id: string) => void;
   setQuotaRotation: (on: boolean) => void;
+  setWireProtocol: (value: 'auto' | 'responses' | 'chat-completions') => void;
+  setReasoningSummary: (value: 'auto' | 'concise' | 'detailed') => void;
 }
 
 function useSavedFlash(savedCount: number): boolean {
@@ -110,12 +112,16 @@ function AdvancedSettings(props: {
   disabled: boolean;
   edit: (field: FieldName, text: string) => void;
   setQuotaRotation: (on: boolean) => void;
+  setWireProtocol: (value: 'auto' | 'responses' | 'chat-completions') => void;
+  setReasoningSummary: (value: 'auto' | 'concise' | 'detailed') => void;
 }): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const customizedCount =
     (props.state.apiBase !== DEFAULT_API_BASE ? 1 : 0) +
     (props.state.concurrency !== 1 ? 1 : 0) +
-    (props.state.quotaRotation !== false ? 1 : 0);
+    (props.state.quotaRotation !== false ? 1 : 0) +
+    (props.state.wireProtocol !== 'auto' ? 1 : 0) +
+    (props.state.reasoningSummary !== 'auto' ? 1 : 0);
 
   return (
     <div className="sn-card sn-advanced">
@@ -195,6 +201,54 @@ function AdvancedSettings(props: {
           </label>
           <p className="sn-hint">{props.t('quotaRotationHint')}</p>
         </div>
+
+        <div className="sn-field">
+          <label className="sn-label" htmlFor="sn-wire-protocol">
+            {props.t('wireProtocol')}
+          </label>
+          <div className="sn-activeAccountSelect">
+            <select
+              id="sn-wire-protocol"
+              className="sn-input"
+              value={props.state.wireProtocolDraft}
+              disabled={props.disabled}
+              onChange={(event: ChangeEventLike) => props.setWireProtocol(
+                event.target.value === 'responses' || event.target.value === 'chat-completions' ? event.target.value : 'auto',
+              )}
+            >
+              <option value="auto">{props.t('wireProtocolAuto')}</option>
+              <option value="responses">{props.t('wireProtocolResponses')}</option>
+              <option value="chat-completions">{props.t('wireProtocolChatCompletions')}</option>
+            </select>
+            <span className="sn-selectChevron" aria-hidden="true" />
+          </div>
+          <p className="sn-hint">{props.t('wireProtocolHint')}</p>
+        </div>
+
+        <div className="sn-field">
+          <label className="sn-label" htmlFor="sn-reasoning-summary">
+            {props.t('reasoningSummary')}
+          </label>
+          <div className="sn-activeAccountSelect">
+            <select
+              id="sn-reasoning-summary"
+              className="sn-input"
+              value={props.state.reasoningSummaryDraft}
+              disabled={props.disabled}
+              onChange={(event: ChangeEventLike) => props.setReasoningSummary(
+                event.target.value === 'concise' || event.target.value === 'detailed' ? event.target.value : 'auto',
+              )}
+            >
+              <option value="auto">{props.t('reasoningSummaryAuto')}</option>
+              <option value="concise">{props.t('reasoningSummaryConcise')}</option>
+              <option value="detailed">{props.t('reasoningSummaryDetailed')}</option>
+            </select>
+            <span className="sn-selectChevron" aria-hidden="true" />
+          </div>
+          <p className="sn-hint">{props.t('reasoningSummaryHint')}</p>
+        </div>
+
+        <p className="sn-hint sn-modelsNote">{props.t('wireTradeoffsNote')}</p>
       </div>
     </div>
   );
@@ -348,7 +402,15 @@ export function SenseNovaSection(props: SenseNovaSectionProps): JSX.Element {
 
       {/* 分组 3：高级选项 */}
       <SectionHeading text={t('groupAdvanced')} />
-      <AdvancedSettings t={t} state={state} disabled={disabled} edit={props.edit} setQuotaRotation={props.setQuotaRotation} />
+      <AdvancedSettings
+        t={t}
+        state={state}
+        disabled={disabled}
+        edit={props.edit}
+        setQuotaRotation={props.setQuotaRotation}
+        setWireProtocol={props.setWireProtocol}
+        setReasoningSummary={props.setReasoningSummary}
+      />
 
       {/* 保存 / 重置 */}
       <div className="sn-footer">

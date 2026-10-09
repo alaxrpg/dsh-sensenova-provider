@@ -5,6 +5,7 @@ node_modules
 .mimosa/
 # npm 发布依赖 peerDependencies 范围，锁文件为本地安装残留不入库
 package-lock.json
+pnpm-lock.yaml
 *.tsbuildinfo
 *.log
 .DS_Store

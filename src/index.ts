@@ -27,6 +27,8 @@ import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment';
 import { SensenovaAccountPool, type AccountSlot } from './accounts.ts';
 import { SensenovaAdapter } from './adapter.ts';
+import type { WireProtocol } from './wire/plan.ts';
+import type { ReasoningSummary } from './wire/body-responses.ts';
 
 export const name = 'llm-sensenova';
 // 模型目录首次加载依赖凭据服务；声明依赖避免 host 启动竞态把已配置账户看成无 key。
@@ -43,31 +45,51 @@ export interface SensenovaAccountConfig {
   apiKeyEnv?: string;
 }
 
-/** 插件配置（schemastery schema 的输出形状，所有字段均可选）。 */
-export interface SensenovaConfig {
-  apiKeyEnv?: string;
-  apiBase?: string;
-  accounts?: SensenovaAccountConfig[];
-  activeAccount?: string;
-  /** 每 key 并发生成请求上限（正整数，默认 1）。 */
-  concurrency?: number;
-  /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
-  quotaRotation?: boolean;
+/** 0.1.7-rc.2 起 volatile 配置字段以稳定引用（{ get() }）形式注入；兼容程序化构造的普通值。 */
+type VolatileLike = { get(): unknown };
+
+function snap<T>(value: T | VolatileLike): T {
+  const unwrapped = typeof value === 'object' && value !== null && typeof (value as VolatileLike).get === 'function'
+    ? (value as VolatileLike).get()
+    : value;
+  return unwrapped as T;
 }
 
-export const Config: z<SensenovaConfig> = z.object({
-  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
-  apiBase: z.string().default(DEFAULT_API_BASE),
+/** 插件配置（schemastery schema 的输出形状，所有字段均可选；volatile 字段可为稳定引用）。 */
+export interface SensenovaConfig {
+  apiKeyEnv?: string | VolatileLike;
+  apiBase?: string | VolatileLike;
+  accounts?: SensenovaAccountConfig[] | VolatileLike;
+  activeAccount?: string | VolatileLike;
+  /** 每 key 并发生成请求上限（正整数，默认 1）。 */
+  concurrency?: number | VolatileLike;
+  /** 配额类 429 粘性换 key（design D5，默认关；401 行为不变，任何 429 不冷却账号）。 */
+  quotaRotation?: boolean | VolatileLike;
+  /** wire 协议模式（缺省 auto：优先 Responses，决策表降级 Chat）。 */
+  wireProtocol?: WireProtocol | VolatileLike;
+  /** Responses 推理摘要（缺省 auto）。 */
+  reasoningSummary?: ReasoningSummary | VolatileLike;
+}
+
+// volatile 字段的 schema 输入/输出类型与手工声明形状存在 exactOptionalPropertyTypes 下的
+// 结构差异，这里以显式断言固定公开类型（运行时形状不变）。
+export const Config = z.object({
+  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV).volatile(),
+  apiBase: z.string().default(DEFAULT_API_BASE).volatile(),
   accounts: z.array(z.object({
     id: z.string().default(''),
     label: z.string().default(''),
     apiKeyEnv: z.string().role('credential-ref').default(''),
-  })).default([]),
-  activeAccount: z.string().default(''),
-  concurrency: z.natural().min(1).default(1),
+  })).default([]).volatile(),
+  activeAccount: z.string().default('').volatile(),
+  concurrency: z.natural().min(1).default(1).volatile(),
   // 高级设置：「配额类 429 换 key」，默认关（design D5：尊重既有「429 不换 key」决策）。
-  quotaRotation: z.boolean().default(false),
-});
+  quotaRotation: z.boolean().default(false).volatile(),
+  // wire 协议模式（make-responses-default-wire-protocol §5.1；缺省 auto）。
+  wireProtocol: z.union([z.const('auto'), z.const('responses'), z.const('chat-completions')]).default('auto').volatile(),
+  // Responses 推理摘要（reasoning.summary；缺省 auto）。
+  reasoningSummary: z.union([z.const('auto'), z.const('concise'), z.const('detailed')]).default('auto').volatile(),
+}) as unknown as z<SensenovaConfig>;
 
 /** 一个解析后的账户槽位：id/label + 合法 credential-ref 名。 */
 export interface ResolvedAccountSpec {
@@ -87,6 +109,20 @@ export interface ResolvedSensenovaOptions {
   concurrency: number;
   /** 配额类 429 粘性换 key（默认 false）。 */
   quotaRotation: boolean;
+  /** wire 协议模式（默认 auto）。 */
+  wireProtocol: WireProtocol;
+  /** Responses 推理摘要（默认 auto）。 */
+  reasoningSummary: ReasoningSummary;
+}
+
+/** 把 wire 协议配置归一化为三值枚举（非法输入回退 auto）。 */
+export function normalizeWireProtocol(value: unknown): WireProtocol {
+  return value === 'responses' || value === 'chat-completions' ? value : 'auto';
+}
+
+/** 把推理摘要配置归一化为三值枚举（非法输入回退 auto）。 */
+export function normalizeReasoningSummary(value: unknown): ReasoningSummary {
+  return value === 'concise' || value === 'detailed' ? value : 'auto';
 }
 
 /** 把配置的并发上限归一化为正整数（非正整数/无法解析回退 1）。 */
@@ -108,12 +144,17 @@ function resolveSlot(id: string, label: string, value: string): ResolvedAccountS
  * 也用于 settings 快照首次使用。
  */
 export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenovaOptions {
+  // volatile 字段先解引用再判定（兼容普通值与稳定引用两种构造路径）。
+  const apiKeyEnvRaw = snap(config.apiKeyEnv);
+  const apiBaseRaw = snap(config.apiBase);
+  const accountsRaw = snap(config.accounts) ?? [];
+  const activeAccountRaw = snap(config.activeAccount);
   const accounts: ResolvedAccountSpec[] = [];
-  const defaultEnv = typeof config.apiKeyEnv === 'string' && config.apiKeyEnv.trim() !== ''
-    ? config.apiKeyEnv.trim()
+  const defaultEnv = typeof apiKeyEnvRaw === 'string' && apiKeyEnvRaw.trim() !== ''
+    ? apiKeyEnvRaw.trim()
     : DEFAULT_API_KEY_ENV;
   accounts.push(resolveSlot('default', 'Default', defaultEnv));
-  for (const [index, account] of (config.accounts ?? []).entries()) {
+  for (const [index, account] of accountsRaw.entries()) {
     if (account === undefined) continue;
     const refName = typeof account.apiKeyEnv === 'string' && account.apiKeyEnv.trim() !== '' ? account.apiKeyEnv.trim() : undefined;
     if (refName === undefined) continue;
@@ -122,31 +163,25 @@ export function resolveAdapterOptions(config: SensenovaConfig): ResolvedSensenov
     accounts.push(resolveSlot(id, label, refName));
   }
   return {
-    apiBase: typeof config.apiBase === 'string' && config.apiBase.trim() !== ''
-      ? config.apiBase.trim()
+    apiBase: typeof apiBaseRaw === 'string' && apiBaseRaw.trim() !== ''
+      ? apiBaseRaw.trim()
       : DEFAULT_API_BASE,
-    activeAccount: typeof config.activeAccount === 'string' ? config.activeAccount : '',
+    activeAccount: typeof activeAccountRaw === 'string' ? activeAccountRaw : '',
     accounts,
-    concurrency: normalizeConcurrency(config.concurrency),
+    concurrency: normalizeConcurrency(snap(config.concurrency)),
     // 防御非布尔输入（程序化构造可能绕过 Schemastery 归一化）。
-    quotaRotation: config.quotaRotation === true,
+    quotaRotation: snap(config.quotaRotation) === true,
+    wireProtocol: normalizeWireProtocol(snap(config.wireProtocol)),
+    reasoningSummary: normalizeReasoningSummary(snap(config.reasoningSummary)),
   };
 }
 
 export function apply(ctx: Context, config: SensenovaConfig): void {
-  let current = () => config;
-  let lastRaw: SensenovaConfig | undefined;
-  let lastGood: ResolvedSensenovaOptions | undefined;
-
-  const options = (): ResolvedSensenovaOptions => {
-    const raw = current();
-    if (raw === lastRaw && lastGood !== undefined) return lastGood;
-    const next = resolveAdapterOptions(raw);
-    lastRaw = raw;
-    lastGood = next;
-    return next;
-  };
-  options();
+  // 0.1.7-rc.2 起 Settings 从插件 Config schema（volatile 字段）自动派生表单，
+  // 不再有 installSection；volatile 引用快照可能原地更新，故每次调用都重解析，
+  // 不做引用相等性缓存（resolveAdapterOptions 开销极小）。
+  const current = () => config;
+  const options = (): ResolvedSensenovaOptions => resolveAdapterOptions(current());
 
   const resolveRef = async (spec: ResolvedAccountSpec): Promise<string | undefined> => {
     // 防御性校验：即使外部构造了 isLiteral=true，也不得让 ref 原文进入请求。
@@ -218,6 +253,8 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
         accountCount: resolved.accounts.length,
         concurrency: resolved.concurrency,
         quotaRotation: resolved.quotaRotation,
+        wireProtocol: resolved.wireProtocol,
+        reasoningSummary: resolved.reasoningSummary,
       };
     },
     resolveApiKey,
@@ -232,16 +269,4 @@ export function apply(ctx: Context, config: SensenovaConfig): void {
   }]);
 
   ctx.llm.registerAdapter([PROVIDER], adapter);
-
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source;
-      },
-      onChange: () => {
-        lastRaw = undefined;
-        lastGood = undefined;
-      },
-    });
-  });
 }

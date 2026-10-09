@@ -36,6 +36,29 @@ export function normalizeQuotaRotation(value: unknown): boolean {
   return value === true ? true : DEFAULT_QUOTA_ROTATION;
 }
 
+/** wire 协议模式默认值（auto：优先 Responses，决策表降级 Chat）。 */
+export const DEFAULT_WIRE_PROTOCOL = 'auto';
+/** Responses 推理摘要默认值。 */
+export const DEFAULT_REASONING_SUMMARY = 'auto';
+/** wire 协议合法值集合。 */
+export const WIRE_PROTOCOL_OPTIONS = ['auto', 'responses', 'chat-completions'] as const;
+/** 推理摘要合法值集合。 */
+export const REASONING_SUMMARY_OPTIONS = ['auto', 'concise', 'detailed'] as const;
+
+/** 把 wireProtocol 存储值归一化为三值枚举（非法回退 auto）。 */
+export function normalizeWireProtocol(value: unknown): 'auto' | 'responses' | 'chat-completions' {
+  return WIRE_PROTOCOL_OPTIONS.includes(value as (typeof WIRE_PROTOCOL_OPTIONS)[number])
+    ? (value as 'auto' | 'responses' | 'chat-completions')
+    : DEFAULT_WIRE_PROTOCOL;
+}
+
+/** 把 reasoningSummary 存储值归一化为三值枚举（非法回退 auto）。 */
+export function normalizeReasoningSummary(value: unknown): 'auto' | 'concise' | 'detailed' {
+  return REASONING_SUMMARY_OPTIONS.includes(value as (typeof REASONING_SUMMARY_OPTIONS)[number])
+    ? (value as 'auto' | 'concise' | 'detailed')
+    : DEFAULT_REASONING_SUMMARY;
+}
+
 /** 可编辑的设置字段。 */
 export type FieldName = 'apiBase' | 'apiKeyEnv' | 'activeAccount' | 'concurrency';
 
@@ -56,6 +79,10 @@ export interface SenseNovaConfig {
   concurrency?: number;
   /** 配额类 429 是否粘性换 key（默认 false；开启后 401 行为不变，429 仍不冷却账号）。 */
   quotaRotation?: boolean;
+  /** wire 协议模式（默认 auto）。 */
+  wireProtocol?: 'auto' | 'responses' | 'chat-completions';
+  /** Responses 推理摘要（默认 auto）。 */
+  reasoningSummary?: 'auto' | 'concise' | 'detailed';
 }
 
 /** credentials 域提供的面（对齐参考实现的 remote.credentials）。 */
@@ -147,6 +174,14 @@ export interface SettingsState {
   quotaRotation: boolean;
   /** 开关的当前展示值（含未保存 staged）。 */
   quotaRotationDraft: boolean;
+  /** wire 协议模式（实际生效值）。 */
+  wireProtocol: 'auto' | 'responses' | 'chat-completions';
+  /** wire 协议模式的当前展示值（含未保存 staged）。 */
+  wireProtocolDraft: 'auto' | 'responses' | 'chat-completions';
+  /** Responses 推理摘要（实际生效值）。 */
+  reasoningSummary: 'auto' | 'concise' | 'detailed';
+  /** 推理摘要的当前展示值（含未保存 staged）。 */
+  reasoningSummaryDraft: 'auto' | 'concise' | 'detailed';
   dirty: boolean;
   saving: boolean;
   failed: boolean;
@@ -237,6 +272,8 @@ export class SenseNovaSettingsController {
   private stagedActiveAccount: string | undefined;
   private stagedConcurrency: string | undefined;
   private stagedQuotaRotation: boolean | undefined;
+  private stagedWireProtocol: 'auto' | 'responses' | 'chat-completions' | undefined;
+  private stagedReasoningSummary: 'auto' | 'concise' | 'detailed' | undefined;
 
   private defaultKeyDraft = '';
   private defaultClearStaged = false;
@@ -314,6 +351,8 @@ export class SenseNovaSettingsController {
     const activeAccount = typeof this.sectionValue('activeAccount') === 'string' ? (this.sectionValue('activeAccount') as string) : '';
     const concurrency = normalizeConcurrency(this.sectionValue('concurrency'));
     const quotaRotation = normalizeQuotaRotation(this.sectionValue('quotaRotation'));
+    const wireProtocol = normalizeWireProtocol(this.sectionValue('wireProtocol'));
+    const reasoningSummary = normalizeReasoningSummary(this.sectionValue('reasoningSummary'));
     const effectiveActiveAccountId = this.effectiveActiveAccountId(activeAccount, defaultView?.configured ?? false);
     const effectiveActiveAccountLabel = this.effectiveActiveAccountLabel(effectiveActiveAccountId, accounts);
     const configuredCount = (defaultView?.configured ? 1 : 0) + accounts.filter((a) => a.configured).length;
@@ -325,6 +364,8 @@ export class SenseNovaSettingsController {
       this.stagedActiveAccount !== undefined ||
       this.stagedConcurrency !== undefined ||
       this.stagedQuotaRotation !== undefined ||
+      this.stagedWireProtocol !== undefined ||
+      this.stagedReasoningSummary !== undefined ||
       this.defaultKeyDraft !== '' ||
       this.defaultClearStaged ||
       this.addedAccounts.length > 0 ||
@@ -357,6 +398,10 @@ export class SenseNovaSettingsController {
       concurrencyDraft: this.stagedConcurrency ?? String(concurrency),
       quotaRotation,
       quotaRotationDraft: this.stagedQuotaRotation ?? quotaRotation,
+      wireProtocol,
+      wireProtocolDraft: this.stagedWireProtocol ?? wireProtocol,
+      reasoningSummary,
+      reasoningSummaryDraft: this.stagedReasoningSummary ?? reasoningSummary,
       dirty,
       saving: this.saving,
       failed: this.failed,
@@ -518,6 +563,20 @@ export class SenseNovaSettingsController {
     this.publish();
   }
 
+  /** wire 协议模式下拉（staged；非法输入归一化为 auto）。 */
+  setWireProtocol(value: 'auto' | 'responses' | 'chat-completions'): void {
+    this.stagedWireProtocol = normalizeWireProtocol(value);
+    this.failed = false;
+    this.publish();
+  }
+
+  /** Responses 推理摘要下拉（staged；非法输入归一化为 auto）。 */
+  setReasoningSummary(value: 'auto' | 'concise' | 'detailed'): void {
+    this.stagedReasoningSummary = normalizeReasoningSummary(value);
+    this.failed = false;
+    this.publish();
+  }
+
   /** 丢弃所有 staged 编辑。 */
   discard(): void {
     this.stagedApiBase = undefined;
@@ -525,6 +584,8 @@ export class SenseNovaSettingsController {
     this.stagedActiveAccount = undefined;
     this.stagedConcurrency = undefined;
     this.stagedQuotaRotation = undefined;
+    this.stagedWireProtocol = undefined;
+    this.stagedReasoningSummary = undefined;
     this.defaultKeyDraft = '';
     this.defaultClearStaged = false;
     this.addedAccounts = [];
@@ -715,6 +776,12 @@ export class SenseNovaSettingsController {
       }
       if (this.stagedQuotaRotation !== undefined) {
         if (!(await this.writeScope('set', 'quotaRotation', this.stagedQuotaRotation))) landed = false;
+      }
+      if (this.stagedWireProtocol !== undefined) {
+        if (!(await this.writeScope('set', 'wireProtocol', this.stagedWireProtocol))) landed = false;
+      }
+      if (this.stagedReasoningSummary !== undefined) {
+        if (!(await this.writeScope('set', 'reasoningSummary', this.stagedReasoningSummary))) landed = false;
       }
       if (this.addedAccounts.length > 0 || this.removedIds.size > 0 || this.labelDrafts.size > 0) {
         if (!(await this.writeAccounts())) landed = false;
