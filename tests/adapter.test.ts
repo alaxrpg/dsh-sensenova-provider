@@ -233,6 +233,96 @@ test('stream: 401 全部失败抛 INVALID_CREDENTIAL', async () => {
   });
 });
 
+test('listModels: TTL 缓存命中期间从内存应答，不实发 HTTP', async () => {
+  let fetchCount = 0;
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: 'sensenova-6.8-flash-lite', output_modalities: ['text'] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+
+  // 第一次调用实发 HTTP。
+  assert.equal((await adapter.listModels('sensenova')).length, 1);
+  assert.equal(fetchCount, 1, '首次调用实发一次 HTTP');
+
+  // TTL 内（模拟 5s 间隔的反复问询）全部走缓存。
+  for (let i = 0; i < 10; i++) await adapter.listModels('sensenova');
+  assert.equal(fetchCount, 1, 'TTL 内 10 次问询零新增 HTTP');
+});
+
+test('listModels: 并发调用单飞去重（共享同一 in-flight 请求）', async () => {
+  let fetchCount = 0;
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-flash', output_modalities: ['text'] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+
+  const results = await Promise.all(Array.from({ length: 5 }, () => adapter.listModels('sensenova')));
+  assert.equal(fetchCount, 1, '5 个并发调用仅实发 1 次 HTTP');
+  assert.equal(results.every((r) => r.length === 1), true);
+});
+
+test('listModels: 刷新失败退避 60s 且维持旧缓存可读', async () => {
+  let fetchCount = 0;
+  let failNext = false;
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => 'key-1',
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async () => {
+      fetchCount += 1;
+      if (failNext) return new Response('gateway timeout', { status: 504 });
+      return new Response(JSON.stringify({ data: [{ id: 'glm-5.2', output_modalities: ['text'] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+
+  // 首次成功。
+  assert.equal((await adapter.listModels('sensenova')).length, 1);
+  assert.equal(fetchCount, 1);
+
+  // 使下一次刷新失败（通过直接清空 fetchedAt 模拟 TTL 过期）。
+  failNext = true;
+  (adapter as unknown as { catalogFetchedAt: number }).catalogFetchedAt = 0;
+  await assert.rejects(adapter.listModels('sensenova'), (err: unknown) => (err as LlmError).code === 'PROVIDER_HTTP_ERROR');
+  assert.equal(fetchCount, 2, '失败时实发了 HTTP');
+
+  // 退避期内：再次调用不再实发，返回旧缓存。
+  failNext = false;
+  const cached = await adapter.listModels('sensenova');
+  assert.equal(cached.length, 1, '退避期内返回旧缓存');
+  assert.equal(fetchCount, 2, '退避期内零新增 HTTP');
+});
+
+test('listModels: 凭据变化立即失效缓存并重新实发', async () => {
+  let activeKey = 'key-1';
+  let fetchCount = 0;
+  const adapter = new SensenovaAdapter({
+    options: () => CONNECTION,
+    resolveApiKey: async () => activeKey,
+    rotateApiKey: async () => undefined,
+    fetchImpl: (async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: 'kimi-k3', output_modalities: ['text'] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+
+  await adapter.listModels('sensenova');
+  assert.equal(fetchCount, 1);
+
+  activeKey = 'key-2';
+  await adapter.listModels('sensenova');
+  assert.equal(fetchCount, 2, '换 key 后 TTL 内也重新实发');
+});
+
 test('listModels: 过滤文生图模型与已知 stale 模型，保留文本模型', async () => {
   const adapter = catalogAdapter([
     { id: 'sensenova-6.8-flash-lite', output_modalities: ['text'], input_modalities: ['text'] },

@@ -45,6 +45,14 @@ import { DEFAULT_QUEUE_TIMEOUT_MS, KeyedConcurrencyGate, type Release } from './
 const DEFAULT_CONTEXT_WINDOW = 131_072;
 const MODELS_TIMEOUT_MS = 10_000;
 /**
+ * 目录缓存 TTL（毫秒）：宿主（模型选择器/策略 UI）会以秒级周期反复调用
+ * listModels()（2026-10-10 Loon 实测 ~5s 一次），而模型目录变化极慢。
+ * 缓存命中期间从内存应答，不发 HTTP；用户明确「一天一次够用」。
+ */
+const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
+/** 目录刷新失败后的退避（毫秒）：防止故障时退化为秒级重试循环。 */
+const CATALOG_FAILURE_RETRY_MS = 60_000;
+/**
  * 提交给 provider 重试层的延迟上限（毫秒）：本地退避与非配额 429 的
  * Retry-After 均受此约束，同时作为重试策略退避单次上限。
  * fix-sensenova-429-quota-retry（2026-09-04 实测）：原 3000ms 与配额窗口量级
@@ -807,6 +815,12 @@ export class SensenovaAdapter extends LlmAdapter {
   /** 上一次成功目录请求使用的 key/base；变化时旧失败缓存不再可信。 */
   private catalogCredential: string | undefined;
   private catalogApiBase: string | undefined;
+  /** 目录缓存时间戳（毫秒 epoch）；与 TTL 共同决定下次调用是否实发 HTTP。 */
+  private catalogFetchedAt = 0;
+  /** 目录刷新失败后的下次重试时间（毫秒 epoch）；仅失败时写入。 */
+  private catalogNextRetryAt = 0;
+  /** 目录单飞去重：并发的 listModels 共享同一 in-flight Promise。 */
+  private catalogInflight: Promise<CatalogEntry[]> | undefined;
   /**
    * 配额类 429 粘住 key（design D5，仅 quotaRotation 开启时读写）：
    * 有 sessionId 的请求按会话分桶（同一会话后续请求粘住切换后的 key）；
@@ -850,6 +864,22 @@ export class SensenovaAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const models = await this.fetchCatalog();
+    return models.map((model) => ({
+      provider,
+      id: model.id,
+      name: model.name,
+      inputModalities: model.inputModalities,
+    }));
+  }
+
+  /**
+   * 目录获取入口（listModels 专用）：TTL 内从缓存应答，过期后单飞实发 HTTP。
+   * 成功刷新 TTL=CATALOG_TTL_MS（24h）；失败退避 CATALOG_FAILURE_RETRY_MS（60s）
+   * 并维持旧缓存可读，避免宿主秒级问询在故障时退化为秒级重试循环。
+   * 凭据或 apiBase 变化立即失效（换 key/换端点后旧目录不再可信）。
+   */
+  private async fetchCatalog(): Promise<CatalogEntry[]> {
     const connection = this.deps.options();
     let apiKey: string;
     try {
@@ -860,6 +890,44 @@ export class SensenovaAdapter extends LlmAdapter {
       if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return [];
       throw error;
     }
+    const now = Date.now();
+    const credentialChanged = this.catalogCredential !== undefined && this.catalogCredential !== apiKey;
+    const apiBaseChanged = this.catalogApiBase !== undefined && this.catalogApiBase !== connection.apiBase;
+    // 缓存命中：同 key、同 base、未过期。
+    if (
+      !credentialChanged && !apiBaseChanged
+      && this.catalogFetchedAt > 0
+      && now - this.catalogFetchedAt < CATALOG_TTL_MS
+    ) {
+      return this.catalog;
+    }
+    // 失败退避期内也直接返回现有缓存（可能为空数组=首次加载仍失败），不再实发。
+    if (this.catalogNextRetryAt > now) {
+      return this.catalog;
+    }
+    // 单飞去重：并发调用共享同一请求。
+    if (this.catalogInflight !== undefined) {
+      return this.catalogInflight;
+    }
+    const inflight = this.fetchCatalogUncached(connection, apiKey, credentialChanged || apiBaseChanged);
+    this.catalogInflight = inflight;
+    // 完成后无论成败都清掉 inflight；失败时设定退避时间戳。
+    inflight.then(
+      () => { this.catalogInflight = undefined; },
+      () => {
+        this.catalogInflight = undefined;
+        this.catalogNextRetryAt = Date.now() + CATALOG_FAILURE_RETRY_MS;
+      },
+    );
+    return inflight;
+  }
+
+  /** 实际发起 HTTP 目录请求并更新缓存（仅 fetchCatalog 调用）。 */
+  private async fetchCatalogUncached(
+    connection: SensenovaConnection,
+    apiKey: string,
+    invalidateFailedModels: boolean,
+  ): Promise<CatalogEntry[]> {
     const response = await this.fetchImpl(`${connection.apiBase}/models`, {
       headers: {
         accept: 'application/json',
@@ -876,20 +944,14 @@ export class SensenovaAdapter extends LlmAdapter {
     }
     const parsed: unknown = await response.json();
     // 失败缓存只对同一凭据和 API 地址成立；换 key 或切换端点后，旧 404 不应继续隐藏新目录。
-    const credentialChanged = this.catalogCredential !== undefined && this.catalogCredential !== apiKey;
-    const apiBaseChanged = this.catalogApiBase !== undefined && this.catalogApiBase !== connection.apiBase;
-    if (credentialChanged || apiBaseChanged) this.failedModels.clear();
+    if (invalidateFailedModels) this.failedModels.clear();
     // 以新快照原子替换缓存，避免 listModels 新目录与 resolveModel 旧能力不一致。
     const models = parseCatalog(parsed, this.failedModels);
     this.catalogCredential = apiKey;
     this.catalogApiBase = connection.apiBase;
+    this.catalogFetchedAt = Date.now();
     this.catalog = models;
-    return models.map((model) => ({
-      provider,
-      id: model.id,
-      name: model.name,
-      inputModalities: model.inputModalities,
-    }));
+    return models;
   }
 
   override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -1057,6 +1119,8 @@ export class SensenovaAdapter extends LlmAdapter {
           release();
           release = undefined;
           this.failedModels.add(options.model);
+          // 使目录缓存失效：下次 listModels 重新拉取并过滤掉该模型（TTL 缓存否则会返回含此模型的旧快照）。
+          this.catalogFetchedAt = 0;
           throw httpError(attempt.status, errText, retryAfterMs);
         }
         // 429：SenseNova 渠道常态性限流，不代表账号异常。不冷却账号；默认不轮换 key
